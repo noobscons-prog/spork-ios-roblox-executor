@@ -15,7 +15,12 @@
 #define OFFSET_LUA_STATE_GLOBAL   0x78
 #define OFFSET_GLOBAL_STATE_MAIN  0x1a0
 
-#define STRIP_PAC(ptr) ((uintptr_t)(ptr) & 0x0000000FFFFFFFFF)
+// ⚠️ Must be replaced with the actual luau_compile offset for the current version
+#define OFFSET_LUAU_COMPILE       0x0  // TODO: find this
+
+// Do NOT use a blanket PAC strip macro on g_live_L
+// Only use this for intermediate pointers read during the scanning phase
+#define STRIP_PAC_SCAN(ptr) ((uintptr_t)(ptr) & 0x0000000FFFFFFFFF)
 
 void* g_live_L = NULL;
 sigjmp_buf hook_jump_buffer;
@@ -38,8 +43,8 @@ uintptr_t get_robloxlib_base(void) {
 }
 
 bool safe_read(void* address, void* buffer, size_t size) {
-    uintptr_t addr = STRIP_PAC(address);
-    if (addr < 0x100000000) return false; 
+    uintptr_t addr = (uintptr_t)address;
+    if (addr < 0x100000000) return false;
     vm_size_t out_size;
     kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)addr, (vm_size_t)size, (vm_address_t)buffer, &out_size);
     return (kr == KERN_SUCCESS && out_size == size);
@@ -54,45 +59,36 @@ void my_job_step(void* job) {
         void* script_context = NULL;
         
         if (safe_read((char*)job + OFFSET_JOB_SCRIPT_CTX, &script_context, 8) && script_context) {
-            script_context = (void*)STRIP_PAC(script_context);
+            script_context = (void*)STRIP_PAC_SCAN(script_context);
             
             if (!logged_sc) {
                 SporkLog(@"Job::step triggered! Found SC: %p", script_context);
                 logged_sc = true;
             }
             
-            // Scan up to 32KB for the lua_State
             for (int i = 0; i < 0x8000; i += 8) {
                 uintptr_t ptr = 0;
                 if (safe_read((char*)script_context + i, &ptr, 8)) {
-                    uintptr_t stripped_ptr = STRIP_PAC(ptr);
+                    uintptr_t stripped_ptr = STRIP_PAC_SCAN(ptr);
                     
                     if (stripped_ptr > 0x100000000 && stripped_ptr < 0x7FFFFFFFFFFF) {
                         uint8_t tt = 0;
-                        // Check for tt == 8 or 9 (Thread)
                         if (safe_read((void*)(stripped_ptr + 2), &tt, 1) && (tt == 8 || tt == 9)) {
                             SporkLog(@"Found LUA STATE at offset 0x%X: %p (tt=%d)", i, (void*)stripped_ptr, tt);
                             
                             uintptr_t global_state = 0;
                             if (safe_read((void*)(stripped_ptr + OFFSET_LUA_STATE_GLOBAL), &global_state, 8) && global_state) {
-                                global_state = STRIP_PAC(global_state);
+                                global_state = STRIP_PAC_SCAN(global_state);
                                 
                                 uintptr_t main_thread = 0;
                                 if (safe_read((void*)(global_state + OFFSET_GLOBAL_STATE_MAIN), &main_thread, 8) && main_thread) {
-                                    main_thread = STRIP_PAC(main_thread);
-                                    
-                                    // We don't strictly check tt here, we just trust it if it's not null
+                                    // ✅ Key point: use it directly here, do not strip PAC again
                                     SporkLog(@"Found MAIN THREAD: %p", (void*)main_thread);
                                     g_live_L = (void*)main_thread;
                                     
-                                    // Auto execute test script!
                                     ExecuteLuauBytecode("print(\"testing\")", 15);
                                     break;
-                                } else {
-                                    SporkLog(@" -> Failed to read mainthread from GS %p", (void*)global_state);
                                 }
-                            } else {
-                                SporkLog(@" -> Failed to read GS from L %p", (void*)stripped_ptr);
                             }
                         }
                     }
@@ -115,27 +111,20 @@ void SetupHooks(void) {
     
     void* task_scheduler = NULL;
     if (!safe_read((void*)(base + OFFSET_TASKSCHEDULER), &task_scheduler, 8)) { SporkLog(@"TaskScheduler failed."); return; }
-    task_scheduler = (void*)STRIP_PAC(task_scheduler);
+    task_scheduler = (void*)STRIP_PAC_SCAN(task_scheduler);
 
     uintptr_t start = 0, end = 0;
     safe_read((char*)task_scheduler + OFFSET_TS_JOBS_START, &start, 8);
     safe_read((char*)task_scheduler + OFFSET_TS_JOBS_END, &end, 8);
-    start = STRIP_PAC(start); end = STRIP_PAC(end);
+    start = STRIP_PAC_SCAN(start); end = STRIP_PAC_SCAN(end);
 
     SporkLog(@"Scanning Jobs to hook VTable...");
     
     for (uintptr_t ptr = start; ptr < end; ptr += 0x10) {
         void* j = NULL;
         if (!safe_read((void*)ptr, &j, 8) || !j) continue;
-        uintptr_t stripped_j = STRIP_PAC(j);
+        uintptr_t stripped_j = STRIP_PAC_SCAN(j);
         
-        char job_name[64] = {0};
-        safe_read((char*)stripped_j + OFFSET_JOB_NAME, job_name, 23);
-        
-        if (strlen(job_name) > 2) {
-            SporkLog(@"Job: %s", job_name);
-        }
-
         void* sc = NULL;
         if (safe_read((char*)stripped_j + OFFSET_JOB_SCRIPT_CTX, &sc, 8) && sc) {
             void** original_vtable = *(void***)j;
@@ -153,7 +142,7 @@ void SetupHooks(void) {
                 SporkLog(@"Success: Hooked Job::step via VTable!");
                 return;
             } else {
-                SporkLog(@"Failed to protect memory for VTable hook: %d", kr);
+                SporkLog(@"Failed to protect memory: %d", kr);
                 free(new_vtable);
             }
         }
