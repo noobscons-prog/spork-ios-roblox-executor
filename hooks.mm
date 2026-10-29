@@ -43,10 +43,10 @@ void SetupHooks(void) {
     signal(SIGBUS, hook_signal_handler);
 
     uintptr_t base = get_robloxlib_base();
-    if (!base) { SporkLog(@"Hooks: RobloxLib not found."); return; }
+    if (!base) { SporkLog(@"RobloxLib not found."); return; }
 
     void* target = (void*)(base + OFFSET_LUA_GETTOP);
-    uint64_t my_func_addr = (uint64_t)my_lua_gettop;
+    uint64_t my_func_addr = (uint64_t)my_lua_gettop & 0x0000000FFFFFFFFF; // Strip PAC
     
     uint32_t patch[4] = {0x58000050, 0xD61F0200, (uint32_t)(my_func_addr & 0xFFFFFFFF), (uint32_t)(my_func_addr >> 32)};
     uintptr_t page = (uintptr_t)target & ~0x3FFF;
@@ -57,14 +57,14 @@ void SetupHooks(void) {
     int sig = sigsetjmp(hook_jump_buffer, 1);
     
     if (sig == 0) {
-        SporkLog(@"Calling vm_protect on page 0x%llx", (uint64_t)page);
         kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
         SporkLog(@"vm_protect returned: %d", kr);
         
         if (kr == KERN_SUCCESS) {
-            SporkLog(@"Calling memcpy to patch instructions...");
-            memcpy(target, patch, 16);
-            SporkLog(@"memcpy done. Flushing cache...");
+            // Use mach_vm_write instead of memcpy to bypass CSE
+            kern_return_t wr = mach_vm_write(mach_task_self(), (mach_vm_address_t)target, (vm_offset_t)patch, 16);
+            SporkLog(@"mach_vm_write returned: %d", wr);
+            
             sys_icache_invalidate(target, 16);
             vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_EXECUTE);
             in_hook_exec = 0;
