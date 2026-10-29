@@ -8,14 +8,12 @@
 extern "C" {
 #endif
 
-// Offsets from your dump
-#define OFFSET_LUAU_COMPILE 0x0 // Set this if you ever find the compiler
+#define OFFSET_LUAU_COMPILE 0x0 
 #define OFFSET_LUAU_LOAD 0x44bc110
 #define OFFSET_LUA_PCALL 0x4490fec
 #define OFFSET_LUA_NEWTHREAD 0x448df3c
 #define OFFSET_LUA_SANDBOXTHREAD 0x1a12ad4
 
-// Function typedefs
 typedef char* (*luau_compile_t)(const char* source, size_t source_size, void* options, size_t* bytecode_size);
 typedef int (*luau_load_t)(void* L, const char* chunkname, const char* data, size_t size, int env);
 typedef int (*lua_pcall_t)(void* L, int nargs, int nresults, int errfunc);
