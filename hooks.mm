@@ -23,7 +23,6 @@ sigjmp_buf hook_jump_buffer;
 volatile sig_atomic_t in_hook_exec = 0;
 
 extern void SporkLog(NSString *format, ...);
-extern void ExecuteLuauBytecode(const char* source, size_t size);
 
 void hook_signal_handler(int sig) {
     if (in_hook_exec) siglongjmp(hook_jump_buffer, sig);
@@ -65,6 +64,7 @@ bool FindLuaState(void) {
                     void* sc = NULL;
                     if (safe_read((char*)stripped_j + OFFSET_JOB_SCRIPT_CTX, &sc, 8) && sc) {
                         sc = (void*)STRIP_PAC_SCAN(sc);
+                        // STRICT CHECK: Must be a valid memory address
                         if ((uintptr_t)sc > 0x100000000 && (uintptr_t)sc < 0x7FFFFFFFFFFF) {
                             g_script_context = sc;
                             break;
