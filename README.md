@@ -1,6 +1,6 @@
 # spork-ios-roblox-executor
-# Why Should You Help?
-**If You Have Any Experience, You’ll Be Paid If Your Forked/Edited Version Works. Unfortunately We Don’t Pay Upfront So Don’t Waste Your Time If You Expect Upfront Payment Without Source Code.**
+# Why Should You Help And Use This?
+**If You Have Any Experience And Help Out Making It Work, I’ll Be Able To Arrange Something For The People That Helped** ( Revenue )
 # a work-in-progress ios executor
 
 - Discord: @rkfq
