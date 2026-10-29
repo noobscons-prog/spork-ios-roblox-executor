@@ -17,7 +17,6 @@
 
 #define STRIP_PAC(ptr) ((uintptr_t)(ptr) & 0x0000000FFFFFFFFF)
 
-// Variables are defined here (they match the extern in the header)
 void* g_live_L = NULL;
 sigjmp_buf hook_jump_buffer;
 volatile sig_atomic_t in_hook_exec = 0;
@@ -62,6 +61,7 @@ void my_job_step(void* job) {
                 logged_sc = true;
             }
             
+            // Scan up to 32KB for the lua_State
             for (int i = 0; i < 0x8000; i += 8) {
                 uintptr_t ptr = 0;
                 if (safe_read((char*)script_context + i, &ptr, 8)) {
@@ -69,7 +69,9 @@ void my_job_step(void* job) {
                     
                     if (stripped_ptr > 0x100000000 && stripped_ptr < 0x7FFFFFFFFFFF) {
                         uint8_t tt = 0;
-                        if (safe_read((void*)(stripped_ptr + 2), &tt, 1) && tt == 9) {
+                        // Check for tt == 8 or 9 (Thread)
+                        if (safe_read((void*)(stripped_ptr + 2), &tt, 1) && (tt == 8 || tt == 9)) {
+                            SporkLog(@"Found LUA STATE at offset 0x%X: %p (tt=%d)", i, (void*)stripped_ptr, tt);
                             
                             uintptr_t global_state = 0;
                             if (safe_read((void*)(stripped_ptr + OFFSET_LUA_STATE_GLOBAL), &global_state, 8) && global_state) {
@@ -79,15 +81,18 @@ void my_job_step(void* job) {
                                 if (safe_read((void*)(global_state + OFFSET_GLOBAL_STATE_MAIN), &main_thread, 8) && main_thread) {
                                     main_thread = STRIP_PAC(main_thread);
                                     
-                                    uint8_t main_tt = 0;
-                                    if (safe_read((void*)(main_thread + 2), &main_tt, 1) && main_tt == 9) {
-                                        SporkLog(@"FOUND MAIN THREAD at offset 0x%X: %p", i, (void*)main_thread);
-                                        g_live_L = (void*)main_thread;
-                                        
-                                        ExecuteLuauBytecode("print(\"testing\")", 15);
-                                        break;
-                                    }
+                                    // We don't strictly check tt here, we just trust it if it's not null
+                                    SporkLog(@"Found MAIN THREAD: %p", (void*)main_thread);
+                                    g_live_L = (void*)main_thread;
+                                    
+                                    // Auto execute test script!
+                                    ExecuteLuauBytecode("print(\"testing\")", 15);
+                                    break;
+                                } else {
+                                    SporkLog(@" -> Failed to read mainthread from GS %p", (void*)global_state);
                                 }
+                            } else {
+                                SporkLog(@" -> Failed to read GS from L %p", (void*)stripped_ptr);
                             }
                         }
                     }
