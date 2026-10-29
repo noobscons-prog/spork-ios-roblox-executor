@@ -1,9 +1,163 @@
 #import <UIKit/UIKit.h>
+#import <mach-o/dyld.h>
+#import <string.h>
+#import <mach/mach.h>
+#import <mach/vm_map.h>
+#import <stdlib.h>
+#import <signal.h>
+#import <setjmp.h>
 #import "SporkUI.h"
+
+// --- Exact Offsets from your 2.744.0.1077 dump ---
+#define OFFSET_LUA_GETTOP         0x448e048
+#define OFFSET_LUAU_LOAD          0x44bc110
+#define OFFSET_LUA_PCALL          0x4490fec
+#define OFFSET_LUA_NEWTHREAD      0x448df3c
+#define OFFSET_LUAL_SANDBOXTHREAD 0x1a12ad4
+
+#define OFFSET_LUA_STATE_GLOBAL   0x78
+#define OFFSET_LUA_STATE_TOP      0x70
+#define OFFSET_LUA_STATE_BASE     0x58
+
+#define STRIP_PAC(ptr) ((uintptr_t)(ptr) & 0x0000000FFFFFFFFF)
 
 bool g_is_injected = true;
 int g_execution_method = 1;
+NSMutableArray<NSString *> *g_logs = nil;
+void* g_live_L = NULL;
 
+// Logging
+void SporkLog(NSString *format, ...) {
+    va_list args;
+    va_start(args, format);
+    NSString *msg = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+    if (!g_logs) g_logs = [NSMutableArray array];
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    [formatter setDateFormat:@"HH:mm:ss"];
+    NSString *logLine = [NSString stringWithFormat:@"[%@] %@", [formatter stringFromDate:[NSDate date]], msg];
+    [g_logs addObject:logLine];
+    NSLog(@"[Spork] %@", msg);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"SporkLogUpdated" object:nil];
+    });
+}
+
+bool safe_read(void* address, void* buffer, size_t size) {
+    uintptr_t addr = STRIP_PAC(address);
+    if (addr < 0x100000000) return false; 
+    vm_size_t out_size;
+    kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)addr, (vm_size_t)size, (vm_address_t)buffer, &out_size);
+    return (kr == KERN_SUCCESS && out_size == size);
+}
+
+uintptr_t get_robloxlib_base(void) {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && strstr(name, "RobloxLib")) return (uintptr_t)_dyld_get_image_header(i);
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------
+// MANUAL INLINE HOOK FOR lua_gettop
+// ---------------------------------------------------------
+int my_lua_gettop(void* L) {
+    if (!g_live_L && L) {
+        g_live_L = L;
+        SporkLog(@"STOLE lua_State via inline hook: %p", L);
+    }
+    // Re-implement lua_gettop logic manually from Lua source
+    uintptr_t top = 0, base = 0;
+    safe_read((char*)L + OFFSET_LUA_STATE_TOP, &top, 8);
+    safe_read((char*)L + OFFSET_LUA_STATE_BASE, &base, 8);
+    return (int)((top - base) / 16);
+}
+
+void SetupInlineHook(void) {
+    uintptr_t base = get_robloxlib_base();
+    if (!base) { SporkLog(@"Base null"); return; }
+    
+    void* target = (void*)(base + OFFSET_LUA_GETTOP);
+    uint64_t my_func_addr = (uint64_t)my_lua_gettop;
+    
+    // ARM64 jump: ldr x16, #8 ; br x16 ; <address>
+    uint32_t patch[4];
+    patch[0] = 0x58000050; 
+    patch[1] = 0xD61F0200; 
+    patch[2] = (uint32_t)(my_func_addr & 0xFFFFFFFF);
+    patch[3] = (uint32_t)(my_func_addr >> 32);
+    
+    uintptr_t page = (uintptr_t)target & ~0xFFF;
+    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+    
+    if (kr != KERN_SUCCESS) {
+        SporkLog(@"vm_protect failed: %d", kr);
+        return;
+    }
+    
+    memcpy(target, patch, 16);
+    vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_EXECUTE);
+    SporkLog(@"Inline hook applied to lua_gettop.");
+}
+
+// ---------------------------------------------------------
+// EXECUTION
+// ---------------------------------------------------------
+typedef int (*lua_pcall_t)(void* L, int nargs, int nresults, int errfunc);
+typedef int (*luau_load_t)(void* L, const char* chunkname, const char* data, size_t size, int env);
+typedef void* (*lua_newthread_t)(void* L);
+typedef void (*luaL_sandboxthread_t)(void* L);
+
+static sigjmp_buf hook_jump_buffer;
+static volatile sig_atomic_t in_hook_exec = 0;
+
+void hook_signal_handler(int sig) {
+    if (in_hook_exec) siglongjmp(hook_jump_buffer, sig);
+}
+
+void ExecuteLuauBytecode(const char* source, size_t size) {
+    if (!g_live_L) {
+        SporkLog(@"L is NULL. Wait for the game to load and call lua_gettop.");
+        return;
+    }
+    
+    uintptr_t base = get_robloxlib_base();
+    luau_load_t luau_load = (luau_load_t)(base + OFFSET_LUAU_LOAD);
+    lua_pcall_t lua_pcall = (lua_pcall_t)(base + OFFSET_LUA_PCALL);
+    lua_newthread_t lua_newthread = (lua_newthread_t)(base + OFFSET_LUA_NEWTHREAD);
+    luaL_sandboxthread_t luaL_sandboxthread = (luaL_sandboxthread_t)(base + OFFSET_LUAL_SANDBOXTHREAD);
+    
+    SporkLog(@"Executing script on L: %p", g_live_L);
+    
+    in_hook_exec = 1;
+    int sig = sigsetjmp(hook_jump_buffer, 1);
+    
+    if (sig == 0) {
+        void* new_L = lua_newthread(g_live_L);
+        if (new_L) {
+            luaL_sandboxthread(new_L);
+            int status = luau_load(new_L, "SporkScript", source, size, 0);
+            if (status == 0) {
+                lua_pcall(new_L, 0, 0, 0);
+                SporkLog(@"Executed successfully!");
+            } else {
+                SporkLog(@"luau_load failed. Status: %d", status);
+            }
+        } else {
+            SporkLog(@"lua_newthread returned NULL.");
+        }
+        in_hook_exec = 0;
+    } else {
+        in_hook_exec = 0;
+        SporkLog(@"HOOK CRASH CAUGHT: Signal %d", sig);
+    }
+}
+
+// ---------------------------------------------------------
+// UI & INIT
+// ---------------------------------------------------------
 @interface PassThroughWindow : UIWindow
 @property (nonatomic, weak) UIView *interactableView1;
 @property (nonatomic, weak) UIView *interactableView2;
@@ -25,29 +179,12 @@ int g_execution_method = 1;
 @end
 
 static PassThroughWindow *overlayWindow = nil;
-NSMutableArray<NSString *> *g_logs = nil;
-
-void SporkLog(NSString *format, ...) {
-    va_list args;
-    va_start(args, format);
-    NSString *msg = [[NSString alloc] initWithFormat:format arguments:args];
-    va_end(args);
-    
-    if (!g_logs) g_logs = [NSMutableArray array];
-    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-    [formatter setDateFormat:@"HH:mm:ss"];
-    NSString *timeStr = [formatter stringFromDate:[NSDate date]];
-    NSString *logLine = [NSString stringWithFormat:@"[%@] %@", timeStr, msg];
-    [g_logs addObject:logLine];
-    NSLog(@"[Spork] %@", msg);
-    
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [[NSNotificationCenter defaultCenter] postNotificationName:@"SporkLogUpdated" object:nil];
-    });
-}
 
 __attribute__((constructor))
 static void init() {
+    signal(SIGSEGV, hook_signal_handler);
+    signal(SIGBUS, hook_signal_handler);
+
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (overlayWindow) return; 
 
@@ -76,5 +213,8 @@ static void init() {
         
         overlayWindow.interactableView1 = vc.mainContainer;
         overlayWindow.interactableView2 = vc.floatingButton;
+        
+        // Apply the inline hook!
+        SetupInlineHook();
     });
 }
