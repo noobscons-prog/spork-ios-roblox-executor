@@ -12,6 +12,9 @@
 #define OFFSET_JOB_NAME           0x18
 #define OFFSET_JOB_SCRIPT_CTX     0x1b0
 
+#define OFFSET_LUA_STATE_GLOBAL   0x78
+#define OFFSET_GLOBAL_STATE_MAIN  0x1a0
+
 #define STRIP_PAC(ptr) ((uintptr_t)(ptr) & 0x0000000FFFFFFFFF)
 
 void* g_live_L = NULL;
@@ -48,7 +51,6 @@ static job_step_t orig_job_step = NULL;
 static bool logged_sc = false;
 
 void my_job_step(void* job) {
-    // Only scan if we haven't found L yet.
     if (job && !g_live_L) {
         void* script_context = NULL;
         
@@ -60,22 +62,37 @@ void my_job_step(void* job) {
                 logged_sc = true;
             }
             
-            // Scan up to 32KB for the lua_State
+            // Scan for a valid lua_State
             for (int i = 0; i < 0x8000; i += 8) {
                 uintptr_t ptr = 0;
                 if (safe_read((char*)script_context + i, &ptr, 8)) {
                     uintptr_t stripped_ptr = STRIP_PAC(ptr);
                     
-                    // FIXED: iOS 64-bit pointers can go up to 0x7FFFFFFFFFFF
                     if (stripped_ptr > 0x100000000 && stripped_ptr < 0x7FFFFFFFFFFF) {
                         uint8_t tt = 0;
+                        // Check if this pointer is a thread (tt == 9)
                         if (safe_read((void*)(stripped_ptr + 2), &tt, 1) && tt == 9) {
-                            SporkLog(@"FOUND LUA STATE at offset 0x%X: %p", i, (void*)stripped_ptr);
-                            g_live_L = (void*)stripped_ptr;
                             
-                            // Auto execute test script!
-                            ExecuteLuauBytecode("print(\"testing\")", 15);
-                            break;
+                            // GET THE MAIN THREAD
+                            uintptr_t global_state = 0;
+                            if (safe_read((void*)(stripped_ptr + OFFSET_LUA_STATE_GLOBAL), &global_state, 8) && global_state) {
+                                global_state = STRIP_PAC(global_state);
+                                
+                                uintptr_t main_thread = 0;
+                                if (safe_read((void*)(global_state + OFFSET_GLOBAL_STATE_MAIN), &main_thread, 8) && main_thread) {
+                                    main_thread = STRIP_PAC(main_thread);
+                                    
+                                    uint8_t main_tt = 0;
+                                    if (safe_read((void*)(main_thread + 2), &main_tt, 1) && main_tt == 9) {
+                                        SporkLog(@"FOUND MAIN THREAD at offset 0x%X: %p", i, (void*)main_thread);
+                                        g_live_L = (void*)main_thread;
+                                        
+                                        // Execute test script!
+                                        ExecuteLuauBytecode("print(\"testing\")", 15);
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -118,7 +135,6 @@ void SetupHooks(void) {
             SporkLog(@"Job: %s", job_name);
         }
 
-        // Hook the first job that has a ScriptContext
         void* sc = NULL;
         if (safe_read((char*)stripped_j + OFFSET_JOB_SCRIPT_CTX, &sc, 8) && sc) {
             void** original_vtable = *(void***)j;
