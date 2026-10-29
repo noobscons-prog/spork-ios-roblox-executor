@@ -1,7 +1,7 @@
 #import "SporkUI.h"
-#import "exploit.hpp"
-#import "hooks.hpp"
 
+// These are defined in Tweak.xm, so we declare them here to link properly
+extern void ExecuteLuauBytecode(const char* source, size_t size);
 extern void* g_live_L;
 extern int g_execution_method;
 
@@ -316,8 +316,8 @@ extern int g_execution_method;
     
     self.statusLabel = [[UILabel alloc] init];
     self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    self.statusLabel.text = @"Not Injected";
-    self.statusLabel.textColor = [UIColor lightGrayColor];
+    self.statusLabel.text = @"Injecting... (see logs)";
+    self.statusLabel.textColor = [UIColor yellowColor];
     self.statusLabel.font = [UIFont systemFontOfSize:12];
     [self.homeTabView addSubview:self.statusLabel];
     
@@ -539,27 +539,16 @@ extern int g_execution_method;
 }
 
 - (void)injectExecutorAction {
-    self.statusLabel.text = @"Injecting... (see logs)";
-    self.statusLabel.textColor = [UIColor yellowColor];
-    
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        SetupHooks();
-        
-        // Wait 2 seconds for the game to naturally call lua_gettop
-        [NSThread sleepForTimeInterval:2.0];
-        
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (g_live_L) {
-                self.statusLabel.text = @"Success! Injected.";
-                self.statusLabel.textColor = [UIColor greenColor];
-                [self.injectBtn setTitle:@"Injected" forState:UIControlStateNormal];
-                self.injectBtn.enabled = NO;
-            } else {
-                self.statusLabel.text = @"Failed (check logs)";
-                self.statusLabel.textColor = [UIColor redColor];
-            }
-        });
-    });
+    // Since Tweak.xm automatically injects on launch, this button just checks status
+    if (g_live_L) {
+        self.statusLabel.text = @"Success! Injected.";
+        self.statusLabel.textColor = [UIColor greenColor];
+        [self.injectBtn setTitle:@"Injected" forState:UIControlStateNormal];
+        self.injectBtn.enabled = NO;
+    } else {
+        self.statusLabel.text = @"Failed (check logs)";
+        self.statusLabel.textColor = [UIColor redColor];
+    }
 }
 
 - (void)executeInfiniteYield {
