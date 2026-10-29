@@ -5,11 +5,8 @@ INSTALL_TARGET_PROCESSES = Roblox
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = Spork
-
-Spork_FILES = Tweak.xm SporkUI.mm memory.cpp hooks.mm exploit.mm
-
-Spork_OBJCFLAGS = -fobjc-arc -I. -I./src
-Spork_OBJCCFLAGS = -fobjc-arc -I. -I./src
-Spork_CFLAGS = -fobjc-arc -I. -I./src
+Spork_FILES = Tweak.xm SporkUI.mm
+Spork_OBJCFLAGS = -fobjc-arc
+Spork_OBJCCFLAGS = -fobjc-arc
 
 include $(THEOS_MAKE_PATH)/tweak.mk
