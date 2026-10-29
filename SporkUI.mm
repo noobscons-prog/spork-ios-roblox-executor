@@ -246,7 +246,7 @@ extern int g_execution_method;
     self.scriptEditor.backgroundColor = [UIColor colorWithRed:0.08 green:0.08 blue:0.08 alpha:1.0];
     self.scriptEditor.textColor = [UIColor colorWithRed:0.8 green:0.8 blue:0.8 alpha:1.0];
     self.scriptEditor.font = [UIFont fontWithName:@"Menlo" size:12];
-    self.scriptEditor.text = @"print(\"Hello from Spork!\")";
+    self.scriptEditor.text = @"print(\"testing\")";
     self.scriptEditor.layer.cornerRadius = 8;
     self.scriptEditor.layer.maskedCorners = kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner;
     [self.editorTabView addSubview:self.scriptEditor];
