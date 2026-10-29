@@ -7,7 +7,8 @@ extern "C" {
 
 extern void* g_live_L;
 void SetupHooks(void);
-uintptr_t get_robloxlib_base(void); // Added this line
+uintptr_t get_robloxlib_base(void);
+void ExecuteLuauBytecode(const char* source, size_t size);
 
 #ifdef __cplusplus
 }
