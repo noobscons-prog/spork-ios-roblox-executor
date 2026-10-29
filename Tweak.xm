@@ -128,14 +128,14 @@ void SetupInlineHook(uintptr_t base) {
     uint32_t patch[4] = {0x58000050, 0xD61F0200, (uint32_t)(my_func_addr & 0xFFFFFFFF), (uint32_t)(my_func_addr >> 32)};
     uintptr_t page = (uintptr_t)target & ~0xFFF;
     
-    // THE FIX: VM_PROT_COPY bypasses iOS Code Signing Enforcement
-    kern_return_t kr = mach_vm_protect(mach_task_self(), (mach_vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    // THE FIX: Use vm_protect with VM_PROT_COPY to bypass Code Signing Enforcement
+    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
     if (kr == KERN_SUCCESS) {
         memcpy(target, patch, 16);
-        mach_vm_protect(mach_task_self(), (mach_vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_EXECUTE);
+        vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_EXECUTE);
         SporkLog(@"Fallback: Patched lua_gettop (CSE Bypassed).");
     } else {
-        SporkLog(@"Fallback: mach_vm_protect failed: %d", kr);
+        SporkLog(@"Fallback: vm_protect failed: %d", kr);
     }
 }
 
