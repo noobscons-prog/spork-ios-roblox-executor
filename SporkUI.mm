@@ -1,7 +1,6 @@
 #import "SporkUI.h"
 #import <Foundation/Foundation.h>
 
-// THE FIX: Wrap the C function in extern "C" to prevent C++ name mangling.
 #ifdef __cplusplus
 extern "C" {
 #endif
