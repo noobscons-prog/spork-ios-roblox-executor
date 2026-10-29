@@ -29,16 +29,9 @@ typedef int (*luau_load_t)(void* L, const char* chunkname, const char* data, siz
 typedef void* (*lua_newthread_t)(void* L);
 typedef void (*luaL_sandboxthread_t)(void* L);
 
-static sigjmp_buf hook_jump_buffer;
-static volatile sig_atomic_t in_hook_exec = 0;
-
-void hook_signal_handler(int sig) {
-    if (in_hook_exec) siglongjmp(hook_jump_buffer, sig);
-}
-
 void ExecuteLuauBytecode(const char* source, size_t size) {
     if (!g_live_L) {
-        SporkLog(@"L is NULL.");
+        SporkLog(@"L is NULL. Wait for game.");
         return;
     }
     
@@ -67,11 +60,10 @@ void ExecuteLuauBytecode(const char* source, size_t size) {
         in_hook_exec = 0;
     } else {
         in_hook_exec = 0;
-        SporkLog(@"HOOK CRASH CAUGHT: Signal %d", sig);
+        SporkLog(@"CRASH CAUGHT: Signal %d", sig);
     }
 }
 
-// UI & INIT
 @interface PassThroughWindow : UIWindow
 @property (nonatomic, weak) UIView *interactableView1;
 @property (nonatomic, weak) UIView *interactableView2;
@@ -96,9 +88,6 @@ static PassThroughWindow *overlayWindow = nil;
 
 __attribute__((constructor))
 static void init() {
-    signal(SIGSEGV, hook_signal_handler);
-    signal(SIGBUS, hook_signal_handler);
-
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (overlayWindow) return; 
 
@@ -128,8 +117,7 @@ static void init() {
         overlayWindow.interactableView1 = vc.mainContainer;
         overlayWindow.interactableView2 = vc.floatingButton;
         
-        // Wait for game to load, then inject
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             SetupHooks();
         });
     });
