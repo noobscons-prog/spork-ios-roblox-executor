@@ -1,4 +1,6 @@
 # spork-ios-roblox-executor
+# IM HAVING ISSUES RIGHT NOW:
+## THR GITHUB MACOS RUNNER FOR BUILDING .DYLIB FILES IS CURRENTLY NOT WORKING, I CANNOT CONTINUE ON THE PROJECT UNTIL IT WORKS AGAIN.
 # a work-in-progress ios executor
 
 - Discord: @rkfq
