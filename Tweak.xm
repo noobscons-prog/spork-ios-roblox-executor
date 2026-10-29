@@ -13,13 +13,16 @@ void SporkLog(NSString *format, ...) {
     va_start(args, format);
     NSString *msg = [[NSString alloc] initWithFormat:format arguments:args];
     va_end(args);
+    
+    // Immediate synchronous NSLog so we don't lose logs on crash
+    NSLog(@"[Spork] %@", msg);
+    
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!g_logs) g_logs = [NSMutableArray array];
         NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
         [formatter setDateFormat:@"HH:mm:ss"];
         NSString *logLine = [NSString stringWithFormat:@"[%@] %@", [formatter stringFromDate:[NSDate date]], msg];
         [g_logs addObject:logLine];
-        NSLog(@"[Spork] %@", msg);
         [[NSNotificationCenter defaultCenter] postNotificationName:@"SporkLogUpdated" object:nil];
     });
 }
@@ -120,6 +123,17 @@ static void init() {
         // Wait 5 seconds for game to fully load before hooking
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             SetupHooks();
+            
+            // Start a background timer to check if we stole the state
+            [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
+                if (g_live_L) {
+                    SporkLog(@"SUCCESS! Stole lua_State: %p", g_live_L);
+                    [timer invalidate];
+                    
+                    // Execute the test script!
+                    ExecuteLuauBytecode("print(\"testing\")", 15);
+                }
+            }];
         });
     });
 }
