@@ -3,12 +3,8 @@
 #import <mach-o/dyld.h>
 #import <string.h>
 #import <mach/mach.h>
-#import <mach/vm_map.h>
-#import <mach/mach_vm.h> // <-- Added for mach_vm_write
+#import <mach/vm_map.h> // vm_write is here!
 #import <libkern/OSCacheControl.h>
-
-// Explicit declaration just in case the SDK hides it
-extern kern_return_t mach_vm_write(vm_map_t target_task, mach_vm_address_t address, vm_offset_t data, mach_msg_type_number_t dataCnt);
 
 #define OFFSET_LUA_GETTOP         0x448e048
 #define OFFSET_LUA_STATE_TOP      0x70
@@ -65,9 +61,9 @@ void SetupHooks(void) {
         SporkLog(@"vm_protect returned: %d", kr);
         
         if (kr == KERN_SUCCESS) {
-            // Use mach_vm_write instead of memcpy to bypass CSE
-            kern_return_t wr = mach_vm_write(mach_task_self(), (mach_vm_address_t)target, (vm_offset_t)patch, (mach_msg_type_number_t)16);
-            SporkLog(@"mach_vm_write returned: %d", wr);
+            // Use vm_write instead of memcpy to bypass CSE
+            kern_return_t wr = vm_write(mach_task_self(), (vm_address_t)target, (vm_offset_t)patch, (mach_msg_type_number_t)16);
+            SporkLog(@"vm_write returned: %d", wr);
             
             sys_icache_invalidate(target, 16);
             vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_EXECUTE);
