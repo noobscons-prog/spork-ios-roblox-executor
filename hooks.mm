@@ -1,3 +1,4 @@
+#import "hooks.hpp" // <--- THIS IS THE FIX
 #import <Foundation/Foundation.h>
 #import <mach-o/dyld.h>
 #import <string.h>
