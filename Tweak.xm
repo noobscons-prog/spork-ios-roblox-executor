@@ -48,21 +48,21 @@ void SporkLog(NSString *format, ...) {
     });
 }
 
-extern "C" bool ExecuteLuauBytecode(const char* source, size_t size) {
+extern "C" void ExecuteLuauBytecode(const char* source, size_t size) {
     if (!g_live_L) {
-        SporkLog(@"L is NULL. Starting brute-force search...");
+        SporkLog(@"L is NULL. Trying to find it...");
         FindLuaState();
     }
     
     if (!g_live_L) {
-        SporkLog(@"Could not find a working L. Try again while in a game.");
-        return false;
+        SporkLog(@"Could not find L. Wait for game to load or try again.");
+        return;
     }
     
     uintptr_t base = get_robloxlib_base();
     if (!base) {
         SporkLog(@"RobloxLib base is NULL.");
-        return false;
+        return;
     }
     
     luau_load_t luau_load = (luau_load_t)(base + OFFSET_LUAU_LOAD);
@@ -106,8 +106,6 @@ extern "C" bool ExecuteLuauBytecode(const char* source, size_t size) {
         in_hook_exec = 0;
         SporkLog(@"CRASH CAUGHT: Signal %d", sig);
     }
-    
-    return g_live_L != NULL;
 }
 
 @interface PassThroughWindow : UIWindow
