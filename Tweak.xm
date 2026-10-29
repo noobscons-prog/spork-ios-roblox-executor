@@ -1,68 +1,11 @@
-#import <UIKit/UIKit.h>
-#import <signal.h>
-#import <setjmp.h>
-#import <Foundation/Foundation.h>
-#import <stdlib.h>
-#import "SporkUI.h"
-#import "hooks.hpp"
+extern "C" bool FindLuaState(void);
 
-bool g_is_injected = true;
-int g_execution_method = 1;
-NSMutableArray<NSString *> *g_logs = nil;
-
-static NSString *getLogPath() {
-    NSString *logsDir = @"/var/mobile/Documents/SporkLogs";
-    if (![[NSFileManager defaultManager] fileExistsAtPath:logsDir]) {
-        [[NSFileManager defaultManager] createDirectoryAtPath:logsDir withIntermediateDirectories:YES attributes:nil error:nil];
-    }
-    return [logsDir stringByAppendingPathComponent:@"execution_logs.txt"];
-}
-
-// NO extern "C" here. It must match SporkUI.h exactly.
-void SporkLog(NSString *format, ...) {
-    va_list args;
-    va_start(args, format);
-    NSString *msg = [[NSString alloc] initWithFormat:format arguments:args];
-    va_end(args);
-    
-    NSLog(@"[Spork] %@", msg);
-    
-    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-    [formatter setDateFormat:@"HH:mm:ss"];
-    NSString *logLine = [NSString stringWithFormat:@"[%@] %@\n", [formatter stringFromDate:[NSDate date]], msg];
-    
-    NSString *path = getLogPath();
-    NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:path];
-    if (fileHandle) {
-        [fileHandle seekToEndOfFile];
-        [fileHandle writeData:[logLine dataUsingEncoding:NSUTF8StringEncoding]];
-        [fileHandle closeFile];
-    } else {
-        [logLine writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    }
-    
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (!g_logs) g_logs = [NSMutableArray array];
-        [g_logs addObject:[logLine stringByTrimmingCharactersInSet:[NSCharacterSet newlineCharacterSet]]];
-        [[NSNotificationCenter defaultCenter] postNotificationName:@"SporkLogUpdated" object:nil];
-    });
-}
-
-typedef int (*lua_pcall_t)(void* L, int nargs, int nresults, int errfunc);
-typedef int (*luau_load_t)(void* L, const char* chunkname, const char* data, size_t size, int env);
-typedef void* (*lua_newthread_t)(void* L);
-typedef void (*luaL_sandboxthread_t)(void* L);
-
-// Pre-compiled Luau bytecode for: print("testing")
-// This bypasses the need for luau_compile just to test the pipeline
-static const unsigned char test_bytecode[] = {
-    0x1B, 0x4C, 0x75, 0x61, 0x75, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-};
-
-// KEEP extern "C" here to match hooks.hpp and SporkUI.mm
 extern "C" void ExecuteLuauBytecode(const char* source, size_t size) {
+    if (!g_live_L) {
+        SporkLog(@"L is NULL. Trying to find it...");
+        FindLuaState();
+    }
+    
     if (!g_live_L) {
         SporkLog(@"L is NULL. Wait for game.");
         return;
@@ -99,7 +42,7 @@ extern "C" void ExecuteLuauBytecode(const char* source, size_t size) {
                     SporkLog(@"luau_compile failed.");
                 }
             } else {
-                SporkLog(@"OFFSET_LUAU_COMPILE missing from dump. Testing with pre-compiled bytecode...");
+                SporkLog(@"OFFSET_LUAU_COMPILE missing. Testing pre-compiled...");
                 status = luau_load(new_L, "SporkTest", (const char*)test_bytecode, sizeof(test_bytecode), 0);
             }
             
@@ -115,68 +58,4 @@ extern "C" void ExecuteLuauBytecode(const char* source, size_t size) {
         in_hook_exec = 0;
         SporkLog(@"CRASH CAUGHT: Signal %d", sig);
     }
-}
-
-@interface PassThroughWindow : UIWindow
-@property (nonatomic, weak) UIView *interactableView1;
-@property (nonatomic, weak) UIView *interactableView2;
-@end
-
-@implementation PassThroughWindow
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *hitView = [super hitTest:point withEvent:event];
-    if (self.interactableView1 && !self.interactableView1.hidden) {
-        CGPoint point1 = [self.interactableView1 convertPoint:point fromView:self];
-        if ([self.interactableView1 pointInside:point1 withEvent:event]) return hitView;
-    }
-    if (self.interactableView2 && !self.interactableView2.hidden) {
-        CGPoint point2 = [self.interactableView2 convertPoint:point fromView:self];
-        if ([self.interactableView2 pointInside:point2 withEvent:event]) return hitView;
-    }
-    return nil; 
-}
-@end
-
-static PassThroughWindow *overlayWindow = nil;
-
-__attribute__((constructor))
-static void init() {
-    SporkLog(@"Spork injected. Starting UI...");
-    
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (overlayWindow) return; 
-
-        UIWindowScene *activeScene = nil;
-        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-            if ([scene isKindOfClass:[UIWindowScene class]]) {
-                activeScene = (UIWindowScene *)scene;
-                break;
-            }
-        }
-
-        if (activeScene) {
-            overlayWindow = [[PassThroughWindow alloc] initWithWindowScene:activeScene];
-        } else {
-            overlayWindow = [[PassThroughWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-        }
-
-        overlayWindow.frame = [UIScreen mainScreen].bounds;
-        overlayWindow.windowLevel = UIWindowLevelAlert + 1000;
-        overlayWindow.backgroundColor = [UIColor clearColor];
-        
-        SporkViewController *vc = [[SporkViewController alloc] init];
-        overlayWindow.rootViewController = vc;
-        overlayWindow.hidden = NO;
-        [overlayWindow makeKeyAndVisible];
-        
-        overlayWindow.interactableView1 = vc.mainContainer;
-        overlayWindow.interactableView2 = vc.floatingButton;
-        
-        SporkLog(@"UI loaded. Waiting 2 seconds before hooking...");
-        
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            SporkLog(@"Starting SetupHooks...");
-            SetupHooks();
-        });
-    });
 }
