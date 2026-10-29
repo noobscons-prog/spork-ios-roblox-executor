@@ -9,13 +9,20 @@
 #import "SporkUI.h"
 
 // --- Exact Offsets from your 2.744.0.1077 dump ---
+#define OFFSET_TASKSCHEDULER      0x6a6d7c0
+#define OFFSET_TS_JOBS_START      0xd0
+#define OFFSET_TS_JOBS_END        0xd8
+#define OFFSET_JOB_NAME           0x18
+#define OFFSET_JOB_SCRIPT_CTX     0x1b0
+
+#define OFFSET_GET_GLOBAL_STATE   0x19ce768 // Fallback signature
+
 #define OFFSET_LUA_GETTOP         0x448e048
 #define OFFSET_LUAU_LOAD          0x44bc110
 #define OFFSET_LUA_PCALL          0x4490fec
 #define OFFSET_LUA_NEWTHREAD      0x448df3c
 #define OFFSET_LUAL_SANDBOXTHREAD 0x1a12ad4
 
-#define OFFSET_LUA_STATE_GLOBAL   0x78
 #define OFFSET_LUA_STATE_TOP      0x70
 #define OFFSET_LUA_STATE_BASE     0x58
 
@@ -25,6 +32,13 @@ bool g_is_injected = true;
 int g_execution_method = 1;
 NSMutableArray<NSString *> *g_logs = nil;
 void* g_live_L = NULL;
+
+// Crash Handler
+static sigjmp_buf hook_jump_buffer;
+static volatile sig_atomic_t in_hook_exec = 0;
+void hook_signal_handler(int sig) {
+    if (in_hook_exec) siglongjmp(hook_jump_buffer, sig);
+}
 
 // Logging
 void SporkLog(NSString *format, ...) {
@@ -61,65 +75,117 @@ uintptr_t get_robloxlib_base(void) {
 }
 
 // ---------------------------------------------------------
-// MANUAL INLINE HOOK FOR lua_gettop
+// 1. Find the "Ugc" Job
+// ---------------------------------------------------------
+void* FindUgcScriptContext(uintptr_t base) {
+    void* task_scheduler = NULL;
+    if (!safe_read((void*)(base + OFFSET_TASKSCHEDULER), &task_scheduler, 8)) return NULL;
+    task_scheduler = (void*)STRIP_PAC(task_scheduler);
+
+    uintptr_t start = 0, end = 0;
+    safe_read((char*)task_scheduler + OFFSET_TS_JOBS_START, &start, 8);
+    safe_read((char*)task_scheduler + OFFSET_TS_JOBS_END, &end, 8);
+    start = STRIP_PAC(start); end = STRIP_PAC(end);
+
+    for (uintptr_t ptr = start; ptr < end; ptr += 0x10) {
+        void* j = NULL;
+        if (!safe_read((void*)ptr, &j, 8) || !j) continue;
+        uintptr_t stripped_j = STRIP_PAC(j);
+        
+        // Read the job name (std::string at +0x18)
+        char job_name[64] = {0};
+        safe_read((char*)stripped_j + OFFSET_JOB_NAME, job_name, 23); // SSO inline read
+
+        if (strcmp(job_name, "Ugc") == 0) {
+            SporkLog(@"Found 'Ugc' Job at %p!", j);
+            void* sc = NULL;
+            if (safe_read((char*)stripped_j + OFFSET_JOB_SCRIPT_CTX, &sc, 8) && sc) {
+                return (void*)STRIP_PAC(sc);
+            }
+        }
+    }
+    return NULL;
+}
+
+// ---------------------------------------------------------
+// 2. Fallback lua_gettop Inline Hook (VM_PROT_COPY)
 // ---------------------------------------------------------
 int my_lua_gettop(void* L) {
     if (!g_live_L && L) {
         g_live_L = L;
-        SporkLog(@"STOLE lua_State via inline hook: %p", L);
+        SporkLog(@"STOLE lua_State via lua_gettop: %p", L);
     }
-    // Re-implement lua_gettop logic manually from Lua source
     uintptr_t top = 0, base = 0;
     safe_read((char*)L + OFFSET_LUA_STATE_TOP, &top, 8);
     safe_read((char*)L + OFFSET_LUA_STATE_BASE, &base, 8);
     return (int)((top - base) / 16);
 }
 
-void SetupInlineHook(void) {
-    uintptr_t base = get_robloxlib_base();
-    if (!base) { SporkLog(@"Base null"); return; }
-    
+void SetupInlineHook(uintptr_t base) {
     void* target = (void*)(base + OFFSET_LUA_GETTOP);
     uint64_t my_func_addr = (uint64_t)my_lua_gettop;
     
-    // ARM64 jump: ldr x16, #8 ; br x16 ; <address>
-    uint32_t patch[4];
-    patch[0] = 0x58000050; 
-    patch[1] = 0xD61F0200; 
-    patch[2] = (uint32_t)(my_func_addr & 0xFFFFFFFF);
-    patch[3] = (uint32_t)(my_func_addr >> 32);
-    
+    uint32_t patch[4] = {0x58000050, 0xD61F0200, (uint32_t)(my_func_addr & 0xFFFFFFFF), (uint32_t)(my_func_addr >> 32)};
     uintptr_t page = (uintptr_t)target & ~0xFFF;
-    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
     
-    if (kr != KERN_SUCCESS) {
-        SporkLog(@"vm_protect failed: %d", kr);
-        return;
+    // THE FIX: VM_PROT_COPY bypasses iOS Code Signing Enforcement
+    kern_return_t kr = mach_vm_protect(mach_task_self(), (mach_vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr == KERN_SUCCESS) {
+        memcpy(target, patch, 16);
+        mach_vm_protect(mach_task_self(), (mach_vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_EXECUTE);
+        SporkLog(@"Fallback: Patched lua_gettop (CSE Bypassed).");
+    } else {
+        SporkLog(@"Fallback: mach_vm_protect failed: %d", kr);
     }
-    
-    memcpy(target, patch, 16);
-    vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_EXECUTE);
-    SporkLog(@"Inline hook applied to lua_gettop.");
 }
 
 // ---------------------------------------------------------
-// EXECUTION
+// 3. Injection & Execution
 // ---------------------------------------------------------
+typedef void* (*get_global_state_t)(void* sc, int* identity, void** script);
+
+void InjectExecutor(void) {
+    uintptr_t base = get_robloxlib_base();
+    if (!base) return;
+
+    void* sc = FindUgcScriptContext(base);
+    if (sc) {
+        SporkLog(@"Found Ugc ScriptContext: %p", sc);
+        
+        // Try get_global_state on the Ugc context
+        get_global_state_t get_gs = (get_global_state_t)(base + OFFSET_GET_GLOBAL_STATE);
+        int id = 0; void* script = NULL;
+        
+        in_hook_exec = 1;
+        int sig = sigsetjmp(hook_jump_buffer, 1);
+        if (sig == 0) {
+            void* L = get_gs(sc, &id, &script);
+            in_hook_exec = 0;
+            if (L) {
+                g_live_L = L;
+                SporkLog(@"SUCCESS! Got lua_State via Ugc: %p", L);
+                return; // We have it!
+            }
+        } else {
+            in_hook_exec = 0;
+            SporkLog(@"get_global_state crashed (Signal %d). Falling back to hook.", sig);
+        }
+    } else {
+        SporkLog(@"Could not find 'Ugc' job. Falling back to hook.");
+    }
+    
+    // If we reach here, get_global_state failed. Use the inline hook.
+    SetupInlineHook(base);
+}
+
 typedef int (*lua_pcall_t)(void* L, int nargs, int nresults, int errfunc);
 typedef int (*luau_load_t)(void* L, const char* chunkname, const char* data, size_t size, int env);
 typedef void* (*lua_newthread_t)(void* L);
 typedef void (*luaL_sandboxthread_t)(void* L);
 
-static sigjmp_buf hook_jump_buffer;
-static volatile sig_atomic_t in_hook_exec = 0;
-
-void hook_signal_handler(int sig) {
-    if (in_hook_exec) siglongjmp(hook_jump_buffer, sig);
-}
-
 void ExecuteLuauBytecode(const char* source, size_t size) {
     if (!g_live_L) {
-        SporkLog(@"L is NULL. Wait for the game to load and call lua_gettop.");
+        SporkLog(@"L is NULL. Wait for the game to load.");
         return;
     }
     
@@ -133,7 +199,6 @@ void ExecuteLuauBytecode(const char* source, size_t size) {
     
     in_hook_exec = 1;
     int sig = sigsetjmp(hook_jump_buffer, 1);
-    
     if (sig == 0) {
         void* new_L = lua_newthread(g_live_L);
         if (new_L) {
@@ -145,8 +210,6 @@ void ExecuteLuauBytecode(const char* source, size_t size) {
             } else {
                 SporkLog(@"luau_load failed. Status: %d", status);
             }
-        } else {
-            SporkLog(@"lua_newthread returned NULL.");
         }
         in_hook_exec = 0;
     } else {
@@ -185,7 +248,7 @@ static void init() {
     signal(SIGSEGV, hook_signal_handler);
     signal(SIGBUS, hook_signal_handler);
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (overlayWindow) return; 
 
         UIWindowScene *activeScene = nil;
@@ -214,7 +277,9 @@ static void init() {
         overlayWindow.interactableView1 = vc.mainContainer;
         overlayWindow.interactableView2 = vc.floatingButton;
         
-        // Apply the inline hook!
-        SetupInlineHook();
+        // Wait a few seconds for the game to load its jobs, then inject
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            InjectExecutor();
+        });
     });
 }
