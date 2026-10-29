@@ -13,7 +13,6 @@ void SporkLog(NSString *format, ...) {
     va_start(args, format);
     NSString *msg = [[NSString alloc] initWithFormat:format arguments:args];
     va_end(args);
-    
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!g_logs) g_logs = [NSMutableArray array];
         NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
@@ -25,7 +24,6 @@ void SporkLog(NSString *format, ...) {
     });
 }
 
-// Execution Functions
 typedef int (*lua_pcall_t)(void* L, int nargs, int nresults, int errfunc);
 typedef int (*luau_load_t)(void* L, const char* chunkname, const char* data, size_t size, int env);
 typedef void* (*lua_newthread_t)(void* L);
@@ -40,7 +38,7 @@ void hook_signal_handler(int sig) {
 
 void ExecuteLuauBytecode(const char* source, size_t size) {
     if (!g_live_L) {
-        SporkLog(@"L is NULL. Wait for the game to load.");
+        SporkLog(@"L is NULL.");
         return;
     }
     
@@ -73,7 +71,7 @@ void ExecuteLuauBytecode(const char* source, size_t size) {
     }
 }
 
-// UI Window
+// UI & INIT
 @interface PassThroughWindow : UIWindow
 @property (nonatomic, weak) UIView *interactableView1;
 @property (nonatomic, weak) UIView *interactableView2;
@@ -101,11 +99,7 @@ static void init() {
     signal(SIGSEGV, hook_signal_handler);
     signal(SIGBUS, hook_signal_handler);
 
-    // APPLY HOOK IMMEDIATELY on launch to avoid race conditions
-    SetupHooks();
-
-    // Wait a bit for the engine to initialize before showing UI
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (overlayWindow) return; 
 
         UIWindowScene *activeScene = nil;
@@ -133,5 +127,10 @@ static void init() {
         
         overlayWindow.interactableView1 = vc.mainContainer;
         overlayWindow.interactableView2 = vc.floatingButton;
+        
+        // Wait for game to load, then inject
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            SetupHooks();
+        });
     });
 }
