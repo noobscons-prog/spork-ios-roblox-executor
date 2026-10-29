@@ -4,8 +4,6 @@
 #import <string.h>
 #import <mach/mach.h>
 #import <mach/vm_map.h>
-#import <signal.h>
-#import <setjmp.h>
 
 #define OFFSET_TASKSCHEDULER      0x6a6d7c0
 #define OFFSET_TS_JOBS_START      0xd0
@@ -17,7 +15,14 @@
 #define STRIP_PAC(ptr) ((uintptr_t)(ptr) & 0x0000000FFFFFFFFF)
 
 void* g_live_L = NULL;
+sigjmp_buf hook_jump_buffer;
+volatile sig_atomic_t in_hook_exec = 0;
+
 extern void SporkLog(NSString *format, ...);
+
+void hook_signal_handler(int sig) {
+    if (in_hook_exec) siglongjmp(hook_jump_buffer, sig);
+}
 
 uintptr_t get_robloxlib_base(void) {
     uint32_t count = _dyld_image_count();
@@ -34,14 +39,6 @@ bool safe_read(void* address, void* buffer, size_t size) {
     vm_size_t out_size;
     kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)addr, (vm_size_t)size, (vm_address_t)buffer, &out_size);
     return (kr == KERN_SUCCESS && out_size == size);
-}
-
-// Crash handler for get_global_state
-static sigjmp_buf hook_jump_buffer;
-static volatile sig_atomic_t in_hook_exec = 0;
-
-void hook_signal_handler(int sig) {
-    if (in_hook_exec) siglongjmp(hook_jump_buffer, sig);
 }
 
 typedef void* (*get_global_state_t)(void* sc, int* identity, void** script);
@@ -73,7 +70,7 @@ void SetupHooks(void) {
         
         void* script_context = NULL;
         if (!safe_read((char*)stripped_j + OFFSET_JOB_SCRIPT_CTX, &script_context, 8) || !script_context) {
-            continue; // Job has no ScriptContext, skip it
+            continue;
         }
         
         script_context = (void*)STRIP_PAC(script_context);
@@ -93,12 +90,12 @@ void SetupHooks(void) {
                 if (g_live_L) {
                     SporkLog(@"SUCCESS! Found VM via Job at %p | lua_State: %p", j, g_live_L);
                     ExecuteLuauBytecode("print(\"testing\")", 15);
-                    return; // Stop scanning, we found it!
+                    return;
                 }
             }
         } else {
             in_hook_exec = 0;
-            // Crash caught, this script_context wasn't the right one. Continue to next job.
+            // Crash caught, try next job
         }
     }
 
