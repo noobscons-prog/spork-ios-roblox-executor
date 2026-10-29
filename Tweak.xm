@@ -30,7 +30,6 @@ void SporkLog(NSString *format, ...) {
     [formatter setDateFormat:@"HH:mm:ss"];
     NSString *logLine = [NSString stringWithFormat:@"[%@] %@\n", [formatter stringFromDate:[NSDate date]], msg];
     
-    // Synchronous write to execution_logs.txt
     NSString *path = getLogPath(@"execution_logs.txt");
     NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:path];
     if (fileHandle) {
@@ -48,7 +47,6 @@ void SporkLog(NSString *format, ...) {
     });
 }
 
-// Crash handler for unhandled exceptions
 void uncaught_exception_handler(NSException *exception) {
     NSString *crashLog = [NSString stringWithFormat:@"CRASH: %@\nReason: %@\nStack: %@\n", exception.name, exception.reason, exception.callStackSymbols];
     NSString *path = getLogPath(@"crash_logs.txt");
