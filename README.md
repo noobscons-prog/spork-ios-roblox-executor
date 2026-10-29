@@ -2,7 +2,7 @@
 help is highly appreciated 
 
 
-
+**STAR = MORE UPDATES AND FASTER RELEASE**
 
 
 
