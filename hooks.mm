@@ -21,18 +21,6 @@ volatile sig_atomic_t in_hook_exec = 0;
 
 extern void SporkLog(NSString *format, ...);
 
-// Safe bytecode for: print("testing")
-static const unsigned char test_bytecode[] = {
-    0x1B, 0x4C, 0x75, 0x61, 0x75, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-};
-
 void hook_signal_handler(int sig) {
     if (in_hook_exec) siglongjmp(hook_jump_buffer, sig);
 }
@@ -55,6 +43,8 @@ bool safe_read(void* address, void* buffer, size_t size) {
 }
 
 bool FindLuaState(void) {
+    if (g_live_L) return true;
+
     if (!g_script_context) {
         uintptr_t base = get_robloxlib_base();
         if (base) {
@@ -66,24 +56,16 @@ bool FindLuaState(void) {
                 safe_read((char*)task_scheduler + OFFSET_TS_JOBS_END, &end, 8);
                 start = STRIP_PAC_SCAN(start); end = STRIP_PAC_SCAN(end);
                 
-                // Prioritize WaitingHybridScriptsJob
                 for (uintptr_t ptr = start; ptr < end; ptr += 0x10) {
                     void* j = NULL;
                     if (!safe_read((void*)ptr, &j, 8) || !j) continue;
                     uintptr_t stripped_j = STRIP_PAC_SCAN(j);
-                    
-                    char job_name[64] = {0};
-                    safe_read((char*)stripped_j + OFFSET_JOB_NAME, job_name, 23);
-                    
-                    if (strstr(job_name, "WaitingHybridScriptsJob")) {
-                        void* sc = NULL;
-                        if (safe_read((char*)stripped_j + OFFSET_JOB_SCRIPT_CTX, &sc, 8) && sc) {
-                            sc = (void*)STRIP_PAC_SCAN(sc);
-                            if ((uintptr_t)sc > 0x100000000 && (uintptr_t)sc < 0x7FFFFFFFFFFF) {
-                                g_script_context = sc;
-                                SporkLog(@"[FIND] Found SC via WaitingHybridScriptsJob: %p", g_script_context);
-                                break;
-                            }
+                    void* sc = NULL;
+                    if (safe_read((char*)stripped_j + OFFSET_JOB_SCRIPT_CTX, &sc, 8) && sc) {
+                        sc = (void*)STRIP_PAC_SCAN(sc);
+                        if ((uintptr_t)sc > 0x100000000 && (uintptr_t)sc < 0x7FFFFFFFFFFF) {
+                            g_script_context = sc;
+                            break;
                         }
                     }
                 }
@@ -100,37 +82,23 @@ bool FindLuaState(void) {
             
             if (stripped_ptr > 0x100000000 && stripped_ptr < 0x7FFFFFFFFFFF && (stripped_ptr % 8 == 0)) {
                 uint8_t tt = 0;
-                // Must be tt=9 (Thread)
+                // ONLY accept tt == 9 (Thread)
                 if (safe_read((void*)(stripped_ptr + 2), &tt, 1) && tt == 9) {
                     
-                    uintptr_t base_ptr = 0;
-                    uintptr_t stack = 0;
-                    uintptr_t stack_last = 0;
-                    uintptr_t top = 0;
-                    uintptr_t global = 0;
-
-                    // Read lua_State struct fields (Safe memory validation)
-                    if (safe_read((void*)(stripped_ptr + 0x58), &base_ptr, 8) &&
-                        safe_read((void*)(stripped_ptr + 0x60), &stack, 8) &&
-                        safe_read((void*)(stripped_ptr + 0x68), &stack_last, 8) &&
-                        safe_read((void*)(stripped_ptr + 0x70), &top, 8) &&
-                        safe_read((void*)(stripped_ptr + 0x78), &global, 8)) {
+                    uintptr_t global_state = 0;
+                    if (safe_read((void*)(stripped_ptr + 0x78), &global_state, 8) && global_state) {
+                        global_state = STRIP_PAC_SCAN(global_state);
                         
-                        base_ptr = STRIP_PAC_SCAN(base_ptr);
-                        stack = STRIP_PAC_SCAN(stack);
-                        stack_last = STRIP_PAC_SCAN(stack_last);
-                        top = STRIP_PAC_SCAN(top);
-                        global = STRIP_PAC_SCAN(global);
-                        
-                        // Validate stack pointers
-                        if (stack > 0x100000000 && base_ptr >= stack && top >= base_ptr && top <= stack_last && global > 0x100000000) {
-                            
-                            // Verify global mainthread backlink (offset 0x1a0 in global_State)
-                            uintptr_t main_thread = 0;
-                            if (safe_read((void*)(global + 0x1a0), &main_thread, 8) && main_thread) {
-                                main_thread = STRIP_PAC_SCAN(main_thread);
-                                if (main_thread == stripped_ptr) {
-                                    SporkLog(@"[FIND] Valid LuaState verified via struct at %p!", (void*)stripped_ptr);
+                        if (global_state > 0x100000000 && global_state < 0x7FFFFFFFFFFF) {
+                            // Read stringtable in global_State to verify it's valid
+                            uint32_t size = 0;
+                            uint32_t nuse = 0;
+                            if (safe_read((void*)(global_state + 0xc), &size, 4) &&
+                                safe_read((void*)(global_state + 0x8), &nuse, 4)) {
+                                
+                                // Size must be a power of 2, and nuse <= size
+                                if (size > 0 && (size & (size - 1)) == 0 && nuse <= size) {
+                                    SporkLog(@"[FIND] Valid L found at 0x%X: %p", i, (void*)stripped_ptr);
                                     g_live_L = (void*)stripped_ptr;
                                     return true;
                                 }
@@ -155,7 +123,7 @@ void my_job_step(void* job) {
     if (job && !g_live_L) {
         static int tick_count = 0;
         tick_count++;
-        // Throttle scanning to once every 60 ticks (~1 second) to prevent lag
+        // Throttle to scan once every 60 ticks (~1 second)
         if (tick_count % 60 == 0) {
             FindLuaState();
         }
