@@ -63,7 +63,7 @@ void ExecuteLuauBytecode(const char* source, size_t size) {
     lua_newthread_t lua_newthread = (lua_newthread_t)(base + 0x448df3c);
     luaL_sandboxthread_t luaL_sandboxthread = (luaL_sandboxthread_t)(base + 0x1a12ad4);
     
-    SporkLog(@"Executing script on L: %p", g_live_L);
+    SporkLog(@"Executing script on main L: %p", g_live_L);
     
     in_hook_exec = 1;
     int sig = sigsetjmp(hook_jump_buffer, 1);
@@ -112,7 +112,8 @@ __attribute__((constructor))
 static void init() {
     SporkLog(@"Spork injected. Starting UI...");
     
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    // FIXED: Increased delay to 4 seconds to allow joining the game
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (overlayWindow) return; 
 
         UIWindowScene *activeScene = nil;
@@ -141,7 +142,7 @@ static void init() {
         overlayWindow.interactableView1 = vc.mainContainer;
         overlayWindow.interactableView2 = vc.floatingButton;
         
-        SporkLog(@"UI loaded. Waiting 2 seconds...");
+        SporkLog(@"UI loaded. Waiting 2 seconds before hooking...");
         
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             SporkLog(@"Starting SetupHooks...");
