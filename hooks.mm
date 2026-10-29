@@ -29,7 +29,6 @@ uintptr_t get_robloxlib_base(void) {
     return 0;
 }
 
-// NO LOGGING HERE. MUST BE EXTREMELY FAST.
 int my_lua_gettop(void* L) {
     if (!g_live_L && L) {
         g_live_L = L;
@@ -44,34 +43,35 @@ void SetupHooks(void) {
     signal(SIGBUS, hook_signal_handler);
 
     uintptr_t base = get_robloxlib_base();
-    if (!base) { SporkLog(@"RobloxLib not found."); return; }
+    if (!base) { SporkLog(@"Hooks: RobloxLib not found."); return; }
 
     void* target = (void*)(base + OFFSET_LUA_GETTOP);
     uint64_t my_func_addr = (uint64_t)my_lua_gettop;
     
     uint32_t patch[4] = {0x58000050, 0xD61F0200, (uint32_t)(my_func_addr & 0xFFFFFFFF), (uint32_t)(my_func_addr >> 32)};
-    
-    // iOS 16+ uses 16KB pages (~0x3FFF)
     uintptr_t page = (uintptr_t)target & ~0x3FFF;
     
-    SporkLog(@"Attempting to patch lua_gettop...");
+    SporkLog(@"Patching lua_gettop at %p", target);
     
-    // Catch the CSE crash during memcpy!
     in_hook_exec = 1;
     int sig = sigsetjmp(hook_jump_buffer, 1);
     
     if (sig == 0) {
+        SporkLog(@"Calling vm_protect on page 0x%llx", (uint64_t)page);
         kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+        SporkLog(@"vm_protect returned: %d", kr);
         
         if (kr == KERN_SUCCESS) {
+            SporkLog(@"Calling memcpy to patch instructions...");
             memcpy(target, patch, 16);
-            sys_icache_invalidate(target, 16); // Flush cache
+            SporkLog(@"memcpy done. Flushing cache...");
+            sys_icache_invalidate(target, 16);
             vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_EXECUTE);
             in_hook_exec = 0;
             SporkLog(@"Successfully patched lua_gettop.");
         } else {
             in_hook_exec = 0;
-            SporkLog(@"vm_protect failed: %d", kr);
+            SporkLog(@"vm_protect failed.");
         }
     } else {
         in_hook_exec = 0;
