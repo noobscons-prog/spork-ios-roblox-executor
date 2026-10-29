@@ -1,6 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <signal.h>
 #import <setjmp.h>
+#import <Foundation/Foundation.h>
 #import "SporkUI.h"
 #import "hooks.hpp"
 
@@ -8,23 +9,51 @@ bool g_is_injected = true;
 int g_execution_method = 1;
 NSMutableArray<NSString *> *g_logs = nil;
 
+static NSString *getLogPath(NSString *filename) {
+    NSString *documents = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *logsDir = [documents stringByAppendingPathComponent:@"SporkLogs"];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:logsDir]) {
+        [[NSFileManager defaultManager] createDirectoryAtPath:logsDir withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+    return [logsDir stringByAppendingPathComponent:filename];
+}
+
 void SporkLog(NSString *format, ...) {
     va_list args;
     va_start(args, format);
     NSString *msg = [[NSString alloc] initWithFormat:format arguments:args];
     va_end(args);
     
-    // Immediate synchronous NSLog so we don't lose logs on crash
     NSLog(@"[Spork] %@", msg);
+    
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    [formatter setDateFormat:@"HH:mm:ss"];
+    NSString *logLine = [NSString stringWithFormat:@"[%@] %@\n", [formatter stringFromDate:[NSDate date]], msg];
+    
+    // Synchronous write to execution_logs.txt
+    NSString *path = getLogPath(@"execution_logs.txt");
+    NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (fileHandle) {
+        [fileHandle seekToEndOfFile];
+        [fileHandle writeData:[logLine dataUsingEncoding:NSUTF8StringEncoding]];
+        [fileHandle closeFile];
+    } else {
+        [logLine writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
     
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!g_logs) g_logs = [NSMutableArray array];
-        NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-        [formatter setDateFormat:@"HH:mm:ss"];
-        NSString *logLine = [NSString stringWithFormat:@"[%@] %@", [formatter stringFromDate:[NSDate date]], msg];
-        [g_logs addObject:logLine];
+        [g_logs addObject:[logLine stringByTrimmingCharactersInSet:[NSCharacterSet newlineCharacterSet]]];
         [[NSNotificationCenter defaultCenter] postNotificationName:@"SporkLogUpdated" object:nil];
     });
+}
+
+// Crash handler for unhandled exceptions
+void uncaught_exception_handler(NSException *exception) {
+    NSString *crashLog = [NSString stringWithFormat:@"CRASH: %@\nReason: %@\nStack: %@\n", exception.name, exception.reason, exception.callStackSymbols];
+    NSString *path = getLogPath(@"crash_logs.txt");
+    [crashLog writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    SporkLog(@"App crashed: %@", exception.name);
 }
 
 typedef int (*lua_pcall_t)(void* L, int nargs, int nresults, int errfunc);
@@ -63,7 +92,7 @@ void ExecuteLuauBytecode(const char* source, size_t size) {
         in_hook_exec = 0;
     } else {
         in_hook_exec = 0;
-        SporkLog(@"CRASH CAUGHT: Signal %d", sig);
+        SporkLog(@"CRASH CAUGHT during execution: Signal %d", sig);
     }
 }
 
@@ -91,6 +120,8 @@ static PassThroughWindow *overlayWindow = nil;
 
 __attribute__((constructor))
 static void init() {
+    NSSetUncaughtExceptionHandler(&uncaught_exception_handler);
+    
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (overlayWindow) return; 
 
@@ -120,17 +151,16 @@ static void init() {
         overlayWindow.interactableView1 = vc.mainContainer;
         overlayWindow.interactableView2 = vc.floatingButton;
         
-        // Wait 5 seconds for game to fully load before hooking
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        SporkLog(@"UI loaded. Waiting 3 seconds for game to stabilize...");
+        
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            SporkLog(@"Starting setup hooks...");
             SetupHooks();
             
-            // Start a background timer to check if we stole the state
             [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
                 if (g_live_L) {
                     SporkLog(@"SUCCESS! Stole lua_State: %p", g_live_L);
                     [timer invalidate];
-                    
-                    // Execute the test script!
                     ExecuteLuauBytecode("print(\"testing\")", 15);
                 }
             }];
