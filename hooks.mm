@@ -17,6 +17,7 @@
 
 #define STRIP_PAC(ptr) ((uintptr_t)(ptr) & 0x0000000FFFFFFFFF)
 
+// Variables are defined here (they match the extern in the header)
 void* g_live_L = NULL;
 sigjmp_buf hook_jump_buffer;
 volatile sig_atomic_t in_hook_exec = 0;
@@ -45,7 +46,6 @@ bool safe_read(void* address, void* buffer, size_t size) {
     return (kr == KERN_SUCCESS && out_size == size);
 }
 
-// Simple replacement for Job::step
 typedef void (*job_step_t)(void* job);
 static job_step_t orig_job_step = NULL;
 static bool logged_sc = false;
@@ -62,7 +62,6 @@ void my_job_step(void* job) {
                 logged_sc = true;
             }
             
-            // Scan for a valid lua_State
             for (int i = 0; i < 0x8000; i += 8) {
                 uintptr_t ptr = 0;
                 if (safe_read((char*)script_context + i, &ptr, 8)) {
@@ -70,10 +69,8 @@ void my_job_step(void* job) {
                     
                     if (stripped_ptr > 0x100000000 && stripped_ptr < 0x7FFFFFFFFFFF) {
                         uint8_t tt = 0;
-                        // Check if this pointer is a thread (tt == 9)
                         if (safe_read((void*)(stripped_ptr + 2), &tt, 1) && tt == 9) {
                             
-                            // GET THE MAIN THREAD
                             uintptr_t global_state = 0;
                             if (safe_read((void*)(stripped_ptr + OFFSET_LUA_STATE_GLOBAL), &global_state, 8) && global_state) {
                                 global_state = STRIP_PAC(global_state);
@@ -87,7 +84,6 @@ void my_job_step(void* job) {
                                         SporkLog(@"FOUND MAIN THREAD at offset 0x%X: %p", i, (void*)main_thread);
                                         g_live_L = (void*)main_thread;
                                         
-                                        // Execute test script!
                                         ExecuteLuauBytecode("print(\"testing\")", 15);
                                         break;
                                     }
