@@ -27,7 +27,7 @@ extern volatile sig_atomic_t in_hook_exec;
 
 void SetupHooks(void);
 uintptr_t get_robloxlib_base(void);
-void ExecuteLuauBytecode(const char* source, size_t size);
+bool ExecuteLuauBytecode(const char* source, size_t size);
 void hook_signal_handler(int sig);
 bool FindLuaState(void);
 
