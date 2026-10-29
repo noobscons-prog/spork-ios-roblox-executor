@@ -5,7 +5,6 @@
 #import <mach/mach.h>
 #import <mach/vm_map.h>
 
-// Offsets from your dump
 #define OFFSET_TASKSCHEDULER      0x6a6d7c0
 #define OFFSET_TS_JOBS_START      0xd0
 #define OFFSET_TS_JOBS_END        0xd8
@@ -38,10 +37,10 @@ bool safe_read(void* address, void* buffer, size_t size) {
 
 void SetupHooks(void) {
     uintptr_t base = get_robloxlib_base();
-    if (!base) return;
+    if (!base) { SporkLog(@"RobloxLib not found."); return; }
 
     void* task_scheduler = NULL;
-    if (!safe_read((void*)(base + OFFSET_TASKSCHEDULER), &task_scheduler, 8)) return;
+    if (!safe_read((void*)(base + OFFSET_TASKSCHEDULER), &task_scheduler, 8)) { SporkLog(@"TaskScheduler failed."); return; }
     task_scheduler = (void*)STRIP_PAC(task_scheduler);
 
     uintptr_t start = 0, end = 0;
@@ -49,19 +48,26 @@ void SetupHooks(void) {
     safe_read((char*)task_scheduler + OFFSET_TS_JOBS_END, &end, 8);
     start = STRIP_PAC(start); end = STRIP_PAC(end);
 
+    SporkLog(@"Scanning Jobs...");
     void* script_context = NULL;
 
-    // Find the "Ugc" or "WaitingHybridScriptsJob"
+    // Iterate through all jobs
     for (uintptr_t ptr = start; ptr < end; ptr += 0x10) {
         void* j = NULL;
         if (!safe_read((void*)ptr, &j, 8) || !j) continue;
         uintptr_t stripped_j = STRIP_PAC(j);
         
         char job_name[64] = {0};
-        safe_read((char*)stripped_j + OFFSET_JOB_NAME, job_name, 32);
+        safe_read((char*)stripped_j + OFFSET_JOB_NAME, job_name, 23);
 
-        if (strcmp(job_name, "Ugc") == 0 || strcmp(job_name, "WaitingHybridScriptsJob") == 0) {
-            SporkLog(@"Found job: %s", job_name);
+        // Log jobs so you can see what the game is using
+        if (strlen(job_name) > 2) {
+            SporkLog(@"Job: %s", job_name);
+        }
+
+        // Look for WaitingHybridScriptsJob
+        if (strcmp(job_name, "WaitingHybridScriptsJob") == 0) {
+            SporkLog(@"Found WaitingHybridScriptsJob!");
             if (safe_read((char*)stripped_j + OFFSET_JOB_SCRIPT_CTX, &script_context, 8) && script_context) {
                 script_context = (void*)STRIP_PAC(script_context);
                 break;
@@ -74,19 +80,25 @@ void SetupHooks(void) {
         return;
     }
 
-    // Call get_global_state(ScriptContext)
-    // Based on iOS executor source, it takes 1 argument (the ScriptContext) and returns the global_State
-    typedef void* (*get_global_state_t)(void* sc);
+    SporkLog(@"Found SC: %p. Calling get_global_state...", script_context);
+
+    // Call get_global_state with 3 args
+    typedef void* (*get_global_state_t)(void* sc, int* identity, void** script);
     get_global_state_t get_gs = (get_global_state_t)(base + OFFSET_GET_GLOBAL_STATE);
     
-    void* global_state = get_gs(script_context);
+    int id = 0; 
+    void* script = NULL;
+    
+    void* global_state = get_gs(script_context, &id, &script);
+    
     if (global_state) {
-        // Read mainthread (lua_State) at +0x1a0
         safe_read((char*)global_state + OFFSET_MAINTHREAD, &g_live_L, 8);
         if (g_live_L) {
             SporkLog(@"SUCCESS! Stole lua_State: %p", g_live_L);
+            // Automatically test execution!
+            ExecuteLuauBytecode("print(\"testing\")", 15);
         } else {
-            SporkLog(@"Failed to read mainthread from global_State");
+            SporkLog(@"Failed to read mainthread");
         }
     } else {
         SporkLog(@"get_global_state returned NULL");
