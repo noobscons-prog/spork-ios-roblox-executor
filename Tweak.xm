@@ -1,32 +1,13 @@
 #import <UIKit/UIKit.h>
-#import <mach-o/dyld.h>
-#import <string.h>
-#import <mach/mach.h>
-#import <mach/vm_map.h>
-#import <stdlib.h>
 #import <signal.h>
 #import <setjmp.h>
-#import <libkern/OSCacheControl.h> // For sys_icache_invalidate
 #import "SporkUI.h"
-
-// --- Exact Offsets from your 2.744.0.1077 dump ---
-#define OFFSET_LUA_GETTOP         0x448e048
-#define OFFSET_LUAU_LOAD          0x44bc110
-#define OFFSET_LUA_PCALL          0x4490fec
-#define OFFSET_LUA_NEWTHREAD      0x448df3c
-#define OFFSET_LUAL_SANDBOXTHREAD 0x1a12ad4
-
-#define OFFSET_LUA_STATE_TOP      0x70
-#define OFFSET_LUA_STATE_BASE     0x58
-
-#define STRIP_PAC(ptr) ((uintptr_t)(ptr) & 0x0000000FFFFFFFFF)
+#import "hooks.hpp"
 
 bool g_is_injected = true;
 int g_execution_method = 1;
 NSMutableArray<NSString *> *g_logs = nil;
-void* g_live_L = NULL;
 
-// Logging
 void SporkLog(NSString *format, ...) {
     va_list args;
     va_start(args, format);
@@ -44,51 +25,7 @@ void SporkLog(NSString *format, ...) {
     });
 }
 
-uintptr_t get_robloxlib_base(void) {
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (name && strstr(name, "RobloxLib")) return (uintptr_t)_dyld_get_image_header(i);
-    }
-    return 0;
-}
-
-// ---------------------------------------------------------
-// FAST lua_gettop HOOK (No Syscalls!)
-// ---------------------------------------------------------
-int my_lua_gettop(void* L) {
-    if (!g_live_L && L) {
-        g_live_L = L;
-        SporkLog(@"STOLE lua_State via lua_gettop: %p", L);
-    }
-    // Direct memory access (no safe_read, no syscalls)
-    uintptr_t top = *(uintptr_t*)((uintptr_t)L + OFFSET_LUA_STATE_TOP);
-    uintptr_t base = *(uintptr_t*)((uintptr_t)L + OFFSET_LUA_STATE_BASE);
-    return (int)((top - base) / 16);
-}
-
-void SetupInlineHook(uintptr_t base) {
-    void* target = (void*)(base + OFFSET_LUA_GETTOP);
-    uint64_t my_func_addr = (uint64_t)my_lua_gettop;
-    
-    uint32_t patch[4] = {0x58000050, 0xD61F0200, (uint32_t)(my_func_addr & 0xFFFFFFFF), (uint32_t)(my_func_addr >> 32)};
-    uintptr_t page = (uintptr_t)target & ~0xFFF;
-    
-    // Use VM_PROT_COPY to bypass Code Signing Enforcement
-    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    if (kr == KERN_SUCCESS) {
-        memcpy(target, patch, 16);
-        sys_icache_invalidate(target, 16); // Flush CPU cache!
-        vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_EXECUTE);
-        SporkLog(@"Patched lua_gettop successfully (CSE Bypassed).");
-    } else {
-        SporkLog(@"vm_protect failed: %d", kr);
-    }
-}
-
-// ---------------------------------------------------------
-// EXECUTION
-// ---------------------------------------------------------
+// Execution Functions
 typedef int (*lua_pcall_t)(void* L, int nargs, int nresults, int errfunc);
 typedef int (*luau_load_t)(void* L, const char* chunkname, const char* data, size_t size, int env);
 typedef void* (*lua_newthread_t)(void* L);
@@ -108,10 +45,10 @@ void ExecuteLuauBytecode(const char* source, size_t size) {
     }
     
     uintptr_t base = get_robloxlib_base();
-    luau_load_t luau_load = (luau_load_t)(base + OFFSET_LUAU_LOAD);
-    lua_pcall_t lua_pcall = (lua_pcall_t)(base + OFFSET_LUA_PCALL);
-    lua_newthread_t lua_newthread = (lua_newthread_t)(base + OFFSET_LUA_NEWTHREAD);
-    luaL_sandboxthread_t luaL_sandboxthread = (luaL_sandboxthread_t)(base + OFFSET_LUAL_SANDBOXTHREAD);
+    luau_load_t luau_load = (luau_load_t)(base + 0x44bc110);
+    lua_pcall_t lua_pcall = (lua_pcall_t)(base + 0x4490fec);
+    lua_newthread_t lua_newthread = (lua_newthread_t)(base + 0x448df3c);
+    luaL_sandboxthread_t luaL_sandboxthread = (luaL_sandboxthread_t)(base + 0x1a12ad4);
     
     SporkLog(@"Executing script on L: %p", g_live_L);
     
@@ -136,9 +73,7 @@ void ExecuteLuauBytecode(const char* source, size_t size) {
     }
 }
 
-// ---------------------------------------------------------
-// UI & INIT
-// ---------------------------------------------------------
+// UI Window
 @interface PassThroughWindow : UIWindow
 @property (nonatomic, weak) UIView *interactableView1;
 @property (nonatomic, weak) UIView *interactableView2;
@@ -166,7 +101,11 @@ static void init() {
     signal(SIGSEGV, hook_signal_handler);
     signal(SIGBUS, hook_signal_handler);
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    // APPLY HOOK IMMEDIATELY on launch to avoid race conditions
+    SetupHooks();
+
+    // Wait a bit for the engine to initialize before showing UI
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (overlayWindow) return; 
 
         UIWindowScene *activeScene = nil;
@@ -194,11 +133,5 @@ static void init() {
         
         overlayWindow.interactableView1 = vc.mainContainer;
         overlayWindow.interactableView2 = vc.floatingButton;
-        
-        // Apply the hook immediately on launch
-        uintptr_t base = get_robloxlib_base();
-        if (base) {
-            SetupInlineHook(base);
-        }
     });
 }
