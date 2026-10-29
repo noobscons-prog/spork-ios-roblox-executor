@@ -54,16 +54,27 @@ void SetupHooks(void) {
     // iOS 16+ uses 16KB pages (~0x3FFF)
     uintptr_t page = (uintptr_t)target & ~0x3FFF;
     
-    SporkLog(@"Patching lua_gettop at %p", target);
+    SporkLog(@"Attempting to patch lua_gettop...");
     
-    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    // Catch the CSE crash during memcpy!
+    in_hook_exec = 1;
+    int sig = sigsetjmp(hook_jump_buffer, 1);
     
-    if (kr == KERN_SUCCESS) {
-        memcpy(target, patch, 16);
-        sys_icache_invalidate(target, 16); // Flush cache
-        vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_EXECUTE);
-        SporkLog(@"Successfully patched lua_gettop.");
+    if (sig == 0) {
+        kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+        
+        if (kr == KERN_SUCCESS) {
+            memcpy(target, patch, 16);
+            sys_icache_invalidate(target, 16); // Flush cache
+            vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_EXECUTE);
+            in_hook_exec = 0;
+            SporkLog(@"Successfully patched lua_gettop.");
+        } else {
+            in_hook_exec = 0;
+            SporkLog(@"vm_protect failed: %d", kr);
+        }
     } else {
-        SporkLog(@"vm_protect failed: %d", kr);
+        in_hook_exec = 0;
+        SporkLog(@"CSE blocked the patch (Signal %d).", sig);
     }
 }
