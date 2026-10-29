@@ -57,7 +57,7 @@ extern "C" void ExecuteLuauBytecode(const char* source, size_t size) {
     }
     
     if (!g_live_L) {
-        SporkLog(@"L is NULL. Wait for game.");
+        SporkLog(@"Could not find L. Wait for game to load or try again.");
         return;
     }
     
