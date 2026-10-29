@@ -1,7 +1,15 @@
 #import "SporkUI.h"
 #import <Foundation/Foundation.h>
 
-extern void ExecuteLuauBytecode(const char* source, size_t size);
+// THE FIX: Wrap the C function in extern "C" to prevent C++ name mangling
+#ifdef __cplusplus
+extern "C" {
+#endif
+void ExecuteLuauBytecode(const char* source, size_t size);
+#ifdef __cplusplus
+}
+#endif
+
 extern void* g_live_L;
 extern int g_execution_method;
 
