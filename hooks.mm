@@ -4,14 +4,19 @@
 #import <string.h>
 #import <mach/mach.h>
 #import <mach/vm_map.h>
-#import <libkern/OSCacheControl.h>
 
-#define OFFSET_LUA_GETTOP         0x448e048
-#define OFFSET_LUA_STATE_TOP      0x70
-#define OFFSET_LUA_STATE_BASE     0x58
+// Offsets from your dump
+#define OFFSET_TASKSCHEDULER      0x6a6d7c0
+#define OFFSET_TS_JOBS_START      0xd0
+#define OFFSET_TS_JOBS_END        0xd8
+#define OFFSET_JOB_NAME           0x18
+#define OFFSET_JOB_SCRIPT_CTX     0x1b0
+#define OFFSET_GET_GLOBAL_STATE   0x19ce768
+#define OFFSET_MAINTHREAD         0x1a0
+
+#define STRIP_PAC(ptr) ((uintptr_t)(ptr) & 0x0000000FFFFFFFFF)
 
 void* g_live_L = NULL;
-
 extern void SporkLog(NSString *format, ...);
 
 uintptr_t get_robloxlib_base(void) {
@@ -23,68 +28,67 @@ uintptr_t get_robloxlib_base(void) {
     return 0;
 }
 
-// Thread-safe hook function (no syscalls, just memory reads)
-int my_lua_gettop(void* L) {
-    if (!L) return 0;
-    
-    // Atomically set g_live_L so multiple threads don't clash
-    void* expected = NULL;
-    __atomic_compare_exchange_n(&g_live_L, &expected, L, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
-    
-    uintptr_t top = *(uintptr_t*)((uintptr_t)L + OFFSET_LUA_STATE_TOP);
-    uintptr_t base = *(uintptr_t*)((uintptr_t)L + OFFSET_LUA_STATE_BASE);
-    return (int)((top - base) / 16);
+bool safe_read(void* address, void* buffer, size_t size) {
+    uintptr_t addr = STRIP_PAC(address);
+    if (addr < 0x100000000) return false; 
+    vm_size_t out_size;
+    kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)addr, (vm_size_t)size, (vm_address_t)buffer, &out_size);
+    return (kr == KERN_SUCCESS && out_size == size);
 }
 
 void SetupHooks(void) {
     uintptr_t base = get_robloxlib_base();
-    if (!base) {
-        SporkLog(@"Hooks: RobloxLib base not found.");
+    if (!base) return;
+
+    void* task_scheduler = NULL;
+    if (!safe_read((void*)(base + OFFSET_TASKSCHEDULER), &task_scheduler, 8)) return;
+    task_scheduler = (void*)STRIP_PAC(task_scheduler);
+
+    uintptr_t start = 0, end = 0;
+    safe_read((char*)task_scheduler + OFFSET_TS_JOBS_START, &start, 8);
+    safe_read((char*)task_scheduler + OFFSET_TS_JOBS_END, &end, 8);
+    start = STRIP_PAC(start); end = STRIP_PAC(end);
+
+    void* script_context = NULL;
+
+    // Find the "Ugc" or "WaitingHybridScriptsJob"
+    for (uintptr_t ptr = start; ptr < end; ptr += 0x10) {
+        void* j = NULL;
+        if (!safe_read((void*)ptr, &j, 8) || !j) continue;
+        uintptr_t stripped_j = STRIP_PAC(j);
+        
+        char job_name[64] = {0};
+        safe_read((char*)stripped_j + OFFSET_JOB_NAME, job_name, 32);
+
+        if (strcmp(job_name, "Ugc") == 0 || strcmp(job_name, "WaitingHybridScriptsJob") == 0) {
+            SporkLog(@"Found job: %s", job_name);
+            if (safe_read((char*)stripped_j + OFFSET_JOB_SCRIPT_CTX, &script_context, 8) && script_context) {
+                script_context = (void*)STRIP_PAC(script_context);
+                break;
+            }
+        }
+    }
+
+    if (!script_context) {
+        SporkLog(@"ScriptContext not found.");
         return;
     }
+
+    // Call get_global_state(ScriptContext)
+    // Based on iOS executor source, it takes 1 argument (the ScriptContext) and returns the global_State
+    typedef void* (*get_global_state_t)(void* sc);
+    get_global_state_t get_gs = (get_global_state_t)(base + OFFSET_GET_GLOBAL_STATE);
     
-    void* target = (void*)(base + OFFSET_LUA_GETTOP);
-    uint64_t my_func_addr = (uint64_t)my_lua_gettop;
-    
-    uint32_t patch[4] = {
-        0x58000050, 
-        0xD61F0200, 
-        (uint32_t)(my_func_addr & 0xFFFFFFFF), 
-        (uint32_t)(my_func_addr >> 32)
-    };
-    
-    uintptr_t page = (uintptr_t)target & ~0xFFF;
-    
-    // 1. Suspend all other threads to prevent race conditions
-    thread_act_array_t threads;
-    mach_msg_type_number_t thread_count;
-    task_threads(mach_task_self(), &threads, &thread_count);
-    
-    thread_t current_thread = mach_thread_self();
-    for (mach_msg_type_number_t i = 0; i < thread_count; i++) {
-        if (threads[i] != current_thread) {
-            thread_suspend(threads[i]);
+    void* global_state = get_gs(script_context);
+    if (global_state) {
+        // Read mainthread (lua_State) at +0x1a0
+        safe_read((char*)global_state + OFFSET_MAINTHREAD, &g_live_L, 8);
+        if (g_live_L) {
+            SporkLog(@"SUCCESS! Stole lua_State: %p", g_live_L);
+        } else {
+            SporkLog(@"Failed to read mainthread from global_State");
         }
-    }
-    
-    // 2. Patch memory
-    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    
-    if (kr == KERN_SUCCESS) {
-        memcpy(target, patch, 16);
-        sys_icache_invalidate(target, 16); // Flush CPU cache
-        vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_EXECUTE);
-        SporkLog(@"Successfully hooked lua_gettop.");
     } else {
-        SporkLog(@"vm_protect failed: %d", kr);
+        SporkLog(@"get_global_state returned NULL");
     }
-    
-    // 3. Resume all threads
-    for (mach_msg_type_number_t i = 0; i < thread_count; i++) {
-        if (threads[i] != current_thread) {
-            thread_resume(threads[i]);
-        }
-        mach_port_deallocate(mach_task_self(), threads[i]);
-    }
-    vm_deallocate(mach_task_self(), (vm_address_t)threads, sizeof(thread_t) * thread_count);
 }
