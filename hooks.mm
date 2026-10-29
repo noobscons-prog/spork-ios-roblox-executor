@@ -21,6 +21,18 @@ volatile sig_atomic_t in_hook_exec = 0;
 
 extern void SporkLog(NSString *format, ...);
 
+// A small, valid pre-compiled bytecode for: print("testing")
+static const unsigned char test_bytecode[] = {
+    0x1B, 0x4C, 0x75, 0x61, 0x75, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
 void hook_signal_handler(int sig) {
     if (in_hook_exec) siglongjmp(hook_jump_buffer, sig);
 }
@@ -42,6 +54,37 @@ bool safe_read(void* address, void* buffer, size_t size) {
     return (kr == KERN_SUCCESS && out_size == size);
 }
 
+bool AttemptExecution(void* candidate) {
+    uintptr_t base = get_robloxlib_base();
+    if (!base) return false;
+
+    luau_load_t luau_load = (luau_load_t)(base + OFFSET_LUAU_LOAD);
+    lua_pcall_t lua_pcall = (lua_pcall_t)(base + OFFSET_LUA_PCALL);
+    lua_newthread_t lua_newthread = (lua_newthread_t)(base + OFFSET_LUA_NEWTHREAD);
+    luaL_sandboxthread_t luaL_sandboxthread = (luaL_sandboxthread_t)(base + OFFSET_LUA_SANDBOXTHREAD);
+
+    in_hook_exec = 1;
+    int sig = sigsetjmp(hook_jump_buffer, 1);
+    if (sig != 0) {
+        in_hook_exec = 0;
+        return false; // Crashed!
+    }
+
+    void* new_L = lua_newthread(candidate);
+    if (new_L) {
+        luaL_sandboxthread(new_L);
+        int status = luau_load(new_L, "Test", (const char*)test_bytecode, sizeof(test_bytecode), 0);
+        if (status == 0) {
+            lua_pcall(new_L, 0, 0, 0);
+            in_hook_exec = 0;
+            return true; // Success!
+        }
+    }
+    
+    in_hook_exec = 0;
+    return false;
+}
+
 bool FindLuaState(void) {
     if (!g_script_context) {
         uintptr_t base = get_robloxlib_base();
@@ -54,42 +97,16 @@ bool FindLuaState(void) {
                 safe_read((char*)task_scheduler + OFFSET_TS_JOBS_END, &end, 8);
                 start = STRIP_PAC_SCAN(start); end = STRIP_PAC_SCAN(end);
                 
-                // 1. Prioritize WaitingHybridScriptsJob
                 for (uintptr_t ptr = start; ptr < end; ptr += 0x10) {
                     void* j = NULL;
                     if (!safe_read((void*)ptr, &j, 8) || !j) continue;
                     uintptr_t stripped_j = STRIP_PAC_SCAN(j);
-                    
-                    char job_name[64] = {0};
-                    safe_read((char*)stripped_j + OFFSET_JOB_NAME, job_name, 23);
-                    
-                    if (strstr(job_name, "WaitingHybridScriptsJob")) {
-                        void* sc = NULL;
-                        if (safe_read((char*)stripped_j + OFFSET_JOB_SCRIPT_CTX, &sc, 8) && sc) {
-                            sc = (void*)STRIP_PAC_SCAN(sc);
-                            if ((uintptr_t)sc > 0x100000000 && (uintptr_t)sc < 0x7FFFFFFFFFFF) {
-                                g_script_context = sc;
-                                SporkLog(@"[FIND] Found SC via WaitingHybridScriptsJob: %p", g_script_context);
-                                break;
-                            }
-                        }
-                    }
-                }
-                
-                // 2. Fallback to any valid SC
-                if (!g_script_context) {
-                    for (uintptr_t ptr = start; ptr < end; ptr += 0x10) {
-                        void* j = NULL;
-                        if (!safe_read((void*)ptr, &j, 8) || !j) continue;
-                        uintptr_t stripped_j = STRIP_PAC_SCAN(j);
-                        void* sc = NULL;
-                        if (safe_read((char*)stripped_j + OFFSET_JOB_SCRIPT_CTX, &sc, 8) && sc) {
-                            sc = (void*)STRIP_PAC_SCAN(sc);
-                            if ((uintptr_t)sc > 0x100000000 && (uintptr_t)sc < 0x7FFFFFFFFFFF) {
-                                g_script_context = sc;
-                                SporkLog(@"[FIND] Fallback SC: %p", g_script_context);
-                                break;
-                            }
+                    void* sc = NULL;
+                    if (safe_read((char*)stripped_j + OFFSET_JOB_SCRIPT_CTX, &sc, 8) && sc) {
+                        sc = (void*)STRIP_PAC_SCAN(sc);
+                        if ((uintptr_t)sc > 0x100000000 && (uintptr_t)sc < 0x7FFFFFFFFFFF) {
+                            g_script_context = sc;
+                            break;
                         }
                     }
                 }
@@ -106,34 +123,14 @@ bool FindLuaState(void) {
             
             if (stripped_ptr > 0x100000000 && stripped_ptr < 0x7FFFFFFFFFFF && (stripped_ptr % 8 == 0)) {
                 uint8_t tt = 0;
-                // ONLY accept tt == 9 (Thread)
                 if (safe_read((void*)(stripped_ptr + 2), &tt, 1) && tt == 9) {
                     
-                    uintptr_t stack = 0;
-                    uintptr_t global_state = 0;
+                    SporkLog(@"[TRY] Attempting to execute on candidate at 0x%X: %p", i, (void*)stripped_ptr);
                     
-                    // Verify lua_State pointers
-                    if (safe_read((void*)(stripped_ptr + 0x60), &stack, 8) && stack &&
-                        safe_read((void*)(stripped_ptr + 0x78), &global_state, 8) && global_state) {
-                        
-                        stack = STRIP_PAC_SCAN(stack);
-                        global_state = STRIP_PAC_SCAN(global_state);
-                        
-                        if (stack > 0x100000000 && stack < 0x7FFFFFFFFFFF && (stack % 8 == 0) &&
-                            global_state > 0x100000000 && global_state < 0x7FFFFFFFFFFF && (global_state % 8 == 0)) {
-                            
-                            // Verify global_state stringtable
-                            uint32_t size = 0;
-                            uint32_t nuse = 0;
-                            safe_read((void*)(global_state + 0x8), &nuse, 4);
-                            safe_read((void*)(global_state + 0xc), &size, 4);
-                            
-                            if (size > 0 && (size & (size - 1)) == 0 && nuse <= size) {
-                                SporkLog(@"[FIND] Valid LuaState verified at %p!", (void*)stripped_ptr);
-                                g_live_L = (void*)stripped_ptr;
-                                return true;
-                            }
-                        }
+                    if (AttemptExecution((void*)stripped_ptr)) {
+                        SporkLog(@"[SUCCESS] Found working L at 0x%X: %p!", i, (void*)stripped_ptr);
+                        g_live_L = (void*)stripped_ptr;
+                        return true;
                     }
                 }
             }
