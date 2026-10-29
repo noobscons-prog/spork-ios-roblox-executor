@@ -19,7 +19,6 @@ static NSString *getLogPath() {
     return [logsDir stringByAppendingPathComponent:@"execution_logs.txt"];
 }
 
-// NO extern "C" here. It must match SporkUI.h exactly.
 void SporkLog(NSString *format, ...) {
     va_list args;
     va_start(args, format);
@@ -49,22 +48,21 @@ void SporkLog(NSString *format, ...) {
     });
 }
 
-// KEEP extern "C" here to match hooks.hpp and SporkUI.mm
-extern "C" void ExecuteLuauBytecode(const char* source, size_t size) {
+extern "C" bool ExecuteLuauBytecode(const char* source, size_t size) {
     if (!g_live_L) {
-        SporkLog(@"L is NULL. Trying to find it...");
+        SporkLog(@"L is NULL. Starting brute-force search...");
         FindLuaState();
     }
     
     if (!g_live_L) {
-        SporkLog(@"Could not find L. Wait for game to load or try again.");
-        return;
+        SporkLog(@"Could not find a working L. Try again while in a game.");
+        return false;
     }
     
     uintptr_t base = get_robloxlib_base();
     if (!base) {
         SporkLog(@"RobloxLib base is NULL.");
-        return;
+        return false;
     }
     
     luau_load_t luau_load = (luau_load_t)(base + OFFSET_LUAU_LOAD);
@@ -108,6 +106,8 @@ extern "C" void ExecuteLuauBytecode(const char* source, size_t size) {
         in_hook_exec = 0;
         SporkLog(@"CRASH CAUGHT: Signal %d", sig);
     }
+    
+    return g_live_L != NULL;
 }
 
 @interface PassThroughWindow : UIWindow
