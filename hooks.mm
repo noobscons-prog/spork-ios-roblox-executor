@@ -46,12 +46,11 @@ bool safe_read(void* address, void* buffer, size_t size) {
 }
 
 typedef void (*job_step_t)(void* job);
-#define MAX_HOOKED_JOBS 64
+#define MAX_HOOKED_JOBS 128
 
 static job_step_t orig_job_steps[MAX_HOOKED_JOBS];
 static void* hooked_jobs[MAX_HOOKED_JOBS];
 static int hooked_job_count = 0;
-static bool logged_sc = false;
 
 void my_job_step(void* job) {
     if (job && !g_live_L) {
@@ -59,41 +58,43 @@ void my_job_step(void* job) {
         if (safe_read((char*)job + OFFSET_JOB_SCRIPT_CTX, &script_context, 8) && script_context) {
             script_context = (void*)STRIP_PAC_SCAN(script_context);
             
-            if (!logged_sc) {
-                char job_name[64] = {0};
-                safe_read((char*)job + OFFSET_JOB_NAME, job_name, 23);
-                if (strlen(job_name) > 2) {
-                    SporkLog(@"Job::step triggered! Job: %s, Found SC: %p", job_name, script_context);
-                } else {
-                    SporkLog(@"Job::step triggered! Unknown Job, Found SC: %p", script_context);
-                }
-                logged_sc = true;
-            }
-            
-            // Scan up to 32KB for the lua_State
-            for (int i = 0; i < 0x8000; i += 8) {
-                uintptr_t ptr = 0;
-                if (safe_read((char*)script_context + i, &ptr, 8)) {
-                    uintptr_t stripped_ptr = STRIP_PAC_SCAN(ptr);
-                    
-                    if (stripped_ptr > 0x100000000 && stripped_ptr < 0x7FFFFFFFFFFF) {
-                        uint8_t tt = 0;
-                        // Check for tt == 8 or 9 (Thread)
-                        if (safe_read((void*)(stripped_ptr + 2), &tt, 1) && (tt == 8 || tt == 9)) {
-                            SporkLog(@"Found LUA STATE at offset 0x%X: %p (tt=%d)", i, (void*)stripped_ptr, tt);
-                            
-                            uintptr_t global_state = 0;
-                            if (safe_read((void*)(stripped_ptr + OFFSET_LUA_STATE_GLOBAL), &global_state, 8) && global_state) {
-                                global_state = STRIP_PAC_SCAN(global_state);
-                                
-                                uintptr_t main_thread = 0;
-                                if (safe_read((void*)(global_state + OFFSET_GLOBAL_STATE_MAIN), &main_thread, 8) && main_thread) {
-                                    SporkLog(@"Found MAIN THREAD: %p", (void*)main_thread);
-                                    g_live_L = (void*)main_thread;
+            // Ensure it's a valid memory pointer (prevents 0x103 crash)
+            if ((uintptr_t)script_context > 0x100000000 && (uintptr_t)script_context < 0x7FFFFFFFFFFF) {
+                
+                // Scan up to 32KB for the lua_State
+                for (int i = 0; i < 0x8000; i += 8) {
+                    uintptr_t ptr = 0;
+                    if (safe_read((char*)script_context + i, &ptr, 8)) {
+                        uintptr_t stripped_ptr = STRIP_PAC_SCAN(ptr);
+                        
+                        if (stripped_ptr > 0x100000000 && stripped_ptr < 0x7FFFFFFFFFFF) {
+                            uint8_t tt = 0;
+                            // Check for tt == 8 or 9 (Thread)
+                            if (safe_read((void*)(stripped_ptr + 2), &tt, 1) && (tt == 8 || tt == 9)) {
+                                uintptr_t global_state = 0;
+                                if (safe_read((void*)(stripped_ptr + OFFSET_LUA_STATE_GLOBAL), &global_state, 8) && global_state) {
+                                    global_state = STRIP_PAC_SCAN(global_state);
                                     
-                                    // Auto execute test script!
-                                    ExecuteLuauBytecode("print(\"testing\")", 15);
-                                    break;
+                                    if (global_state > 0x100000000 && global_state < 0x7FFFFFFFFFFF) {
+                                        uintptr_t main_thread = 0;
+                                        if (safe_read((void*)(global_state + OFFSET_GLOBAL_STATE_MAIN), &main_thread, 8) && main_thread) {
+                                            main_thread = STRIP_PAC_SCAN(main_thread);
+                                            
+                                            if (main_thread > 0x100000000 && main_thread < 0x7FFFFFFFFFFF) {
+                                                // VERIFICATION: Ensure the main thread actually points back to this global_state
+                                                uintptr_t check_global = 0;
+                                                if (safe_read((void*)(main_thread + OFFSET_LUA_STATE_GLOBAL), &check_global, 8) && STRIP_PAC_SCAN(check_global) == global_state) {
+                                                    
+                                                    SporkLog(@"Found VALID MAIN THREAD: %p", (void*)main_thread);
+                                                    g_live_L = (void*)main_thread;
+                                                    
+                                                    // Auto execute test script!
+                                                    ExecuteLuauBytecode("print(\"testing\")", 15);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -133,37 +134,29 @@ void SetupHooks(void) {
     for (uintptr_t ptr = start; ptr < end; ptr += 0x10) {
         void* j = NULL;
         if (!safe_read((void*)ptr, &j, 8) || !j) continue;
-        uintptr_t stripped_j = STRIP_PAC_SCAN(j);
         
-        char job_name[64] = {0};
-        safe_read((char*)stripped_j + OFFSET_JOB_NAME, job_name, 23);
-        
-        if (strlen(job_name) > 2) {
-            SporkLog(@"Job: %s", job_name);
-        }
+        // Hook EVERY job to guarantee we don't miss the real script runner
+        if (hooked_job_count < MAX_HOOKED_JOBS) {
+            void** original_vtable = *(void***)j;
+            
+            // Prevent double hooking
+            if (original_vtable[0] == (void*)my_job_step) continue;
 
-        void* sc = NULL;
-        if (safe_read((char*)stripped_j + OFFSET_JOB_SCRIPT_CTX, &sc, 8) && sc) {
-            if (hooked_job_count < MAX_HOOKED_JOBS) {
-                void** original_vtable = *(void***)j;
-                orig_job_steps[hooked_job_count] = (job_step_t)original_vtable[0];
-                hooked_jobs[hooked_job_count] = j;
-                
-                void** new_vtable = (void**)malloc(0x1000);
-                memcpy(new_vtable, original_vtable, 0x1000);
-                new_vtable[0] = (void*)my_job_step;
-                
-                uintptr_t job_page = (uintptr_t)j & ~0x3FFF;
-                kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)job_page, 0x4000, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-                if (kr == KERN_SUCCESS) {
-                    *(void***)j = new_vtable;
-                    vm_protect(mach_task_self(), (vm_address_t)job_page, 0x4000, false, VM_PROT_READ | VM_PROT_EXECUTE);
-                    SporkLog(@"Success: Hooked Job::step for %s", strlen(job_name) > 2 ? job_name : "Unknown");
-                    hooked_job_count++;
-                } else {
-                    SporkLog(@"Failed to protect memory: %d", kr);
-                    free(new_vtable);
-                }
+            orig_job_steps[hooked_job_count] = (job_step_t)original_vtable[0];
+            hooked_jobs[hooked_job_count] = j;
+            
+            void** new_vtable = (void**)malloc(0x1000);
+            memcpy(new_vtable, original_vtable, 0x1000);
+            new_vtable[0] = (void*)my_job_step;
+            
+            uintptr_t job_page = (uintptr_t)j & ~0x3FFF;
+            kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)job_page, 0x4000, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+            if (kr == KERN_SUCCESS) {
+                *(void***)j = new_vtable;
+                vm_protect(mach_task_self(), (vm_address_t)job_page, 0x4000, false, VM_PROT_READ | VM_PROT_EXECUTE);
+                hooked_job_count++;
+            } else {
+                free(new_vtable);
             }
         }
     }
