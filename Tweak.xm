@@ -112,7 +112,7 @@ __attribute__((constructor))
 static void init() {
     SporkLog(@"Spork injected. Starting UI...");
     
-    // FIXED: Increased delay to 4 seconds to allow joining the game
+    // FIXED: Increased delay to 4 seconds to allow joining the game finally
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (overlayWindow) return; 
 
