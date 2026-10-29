@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <stddef.h>
 #include <setjmp.h>
 #include <signal.h>
 
@@ -7,13 +8,19 @@
 extern "C" {
 #endif
 
-#define OFFSET_LUAU_COMPILE 0x0 
+// Offsets from your dump
+#define OFFSET_LUAU_COMPILE 0x0 // Set this if you ever find the compiler
 #define OFFSET_LUAU_LOAD 0x44bc110
 #define OFFSET_LUA_PCALL 0x4490fec
 #define OFFSET_LUA_NEWTHREAD 0x448df3c
 #define OFFSET_LUA_SANDBOXTHREAD 0x1a12ad4
 
+// Function typedefs
 typedef char* (*luau_compile_t)(const char* source, size_t source_size, void* options, size_t* bytecode_size);
+typedef int (*luau_load_t)(void* L, const char* chunkname, const char* data, size_t size, int env);
+typedef int (*lua_pcall_t)(void* L, int nargs, int nresults, int errfunc);
+typedef void* (*lua_newthread_t)(void* L);
+typedef void (*luaL_sandboxthread_t)(void* L);
 
 extern void* g_live_L;
 extern void* g_script_context;
