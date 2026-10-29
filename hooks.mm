@@ -3,12 +3,16 @@
 #import <mach-o/dyld.h>
 #import <string.h>
 #import <mach/mach.h>
-#import <mach/vm_map.h> // vm_write is here!
+#import <mach/vm_map.h>
 #import <libkern/OSCacheControl.h>
 
-#define OFFSET_LUA_GETTOP         0x448e048
-#define OFFSET_LUA_STATE_TOP      0x70
-#define OFFSET_LUA_STATE_BASE     0x58
+#define OFFSET_TASKSCHEDULER      0x6a6d7c0
+#define OFFSET_TS_JOBS_START      0xd0
+#define OFFSET_TS_JOBS_END        0xd8
+#define OFFSET_JOB_NAME           0x18
+#define OFFSET_JOB_SCRIPT_CTX     0x1b0
+
+#define STRIP_PAC(ptr) ((uintptr_t)(ptr) & 0x0000000FFFFFFFFF)
 
 void* g_live_L = NULL;
 sigjmp_buf hook_jump_buffer;
@@ -29,13 +33,51 @@ uintptr_t get_robloxlib_base(void) {
     return 0;
 }
 
-int my_lua_gettop(void* L) {
-    if (!g_live_L && L) {
-        g_live_L = L;
+bool safe_read(void* address, void* buffer, size_t size) {
+    uintptr_t addr = STRIP_PAC(address);
+    if (addr < 0x100000000) return false; 
+    vm_size_t out_size;
+    kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)addr, (vm_size_t)size, (vm_address_t)buffer, &out_size);
+    return (kr == KERN_SUCCESS && out_size == size);
+}
+
+// Simple replacement for Job::step
+typedef void (*job_step_t)(void* job);
+static job_step_t orig_job_step = NULL;
+
+void my_job_step(void* job) {
+    if (job) {
+        uintptr_t base = get_robloxlib_base();
+        void* script_context = NULL;
+        
+        if (safe_read((char*)job + OFFSET_JOB_SCRIPT_CTX, &script_context, 8) && script_context) {
+            script_context = (void*)STRIP_PAC(script_context);
+            
+            // Log that we found a ScriptContext
+            if (!g_live_L) {
+                SporkLog(@"Job::step triggered! Found SC: %p", script_context);
+                // We will just log the first few pointers in SC to see what's there
+                for (int i = 0; i < 0x4000; i += 8) {
+                    uintptr_t ptr = 0;
+                    if (safe_read((char*)script_context + i, &ptr, 8)) {
+                        if (ptr > 0x100000000 && ptr < 0x400000000) {
+                            // Check if this looks like a lua_State (tt == 9 at +0x2)
+                            uint8_t tt = 0;
+                            if (safe_read((void*)(ptr + 2), &tt, 1) && tt == 9) {
+                                SporkLog(@"FOUND LUA STATE at offset 0x%X: %p", i, (void*)ptr);
+                                g_live_L = (void*)ptr;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
-    uintptr_t top = *(uintptr_t*)((uintptr_t)L + OFFSET_LUA_STATE_TOP);
-    uintptr_t base = *(uintptr_t*)((uintptr_t)L + OFFSET_LUA_STATE_BASE);
-    return (int)((top - base) / 16);
+    
+    if (orig_job_step) {
+        orig_job_step(job);
+    }
 }
 
 void SetupHooks(void) {
@@ -44,37 +86,47 @@ void SetupHooks(void) {
 
     uintptr_t base = get_robloxlib_base();
     if (!base) { SporkLog(@"RobloxLib not found."); return; }
+    
+    void* task_scheduler = NULL;
+    if (!safe_read((void*)(base + OFFSET_TASKSCHEDULER), &task_scheduler, 8)) { SporkLog(@"TaskScheduler failed."); return; }
+    task_scheduler = (void*)STRIP_PAC(task_scheduler);
 
-    void* target = (void*)(base + OFFSET_LUA_GETTOP);
-    uint64_t my_func_addr = (uint64_t)my_lua_gettop & 0x0000000FFFFFFFFF; // Strip PAC
+    uintptr_t start = 0, end = 0;
+    safe_read((char*)task_scheduler + OFFSET_TS_JOBS_START, &start, 8);
+    safe_read((char*)task_scheduler + OFFSET_TS_JOBS_END, &end, 8);
+    start = STRIP_PAC(start); end = STRIP_PAC(end);
+
+    SporkLog(@"Scanning Jobs to hook VTable...");
     
-    uint32_t patch[4] = {0x58000050, 0xD61F0200, (uint32_t)(my_func_addr & 0xFFFFFFFF), (uint32_t)(my_func_addr >> 32)};
-    uintptr_t page = (uintptr_t)target & ~0x3FFF;
-    
-    SporkLog(@"Patching lua_gettop at %p", target);
-    
-    in_hook_exec = 1;
-    int sig = sigsetjmp(hook_jump_buffer, 1);
-    
-    if (sig == 0) {
-        kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-        SporkLog(@"vm_protect returned: %d", kr);
+    for (uintptr_t ptr = start; ptr < end; ptr += 0x10) {
+        void* j = NULL;
+        if (!safe_read((void*)ptr, &j, 8) || !j) continue;
+        uintptr_t stripped_j = STRIP_PAC(j);
         
-        if (kr == KERN_SUCCESS) {
-            // Use vm_write instead of memcpy to bypass CSE
-            kern_return_t wr = vm_write(mach_task_self(), (vm_address_t)target, (vm_offset_t)patch, (mach_msg_type_number_t)16);
-            SporkLog(@"vm_write returned: %d", wr);
-            
-            sys_icache_invalidate(target, 16);
-            vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_EXECUTE);
-            in_hook_exec = 0;
-            SporkLog(@"Successfully patched lua_gettop.");
-        } else {
-            in_hook_exec = 0;
-            SporkLog(@"vm_protect failed.");
+        char job_name[64] = {0};
+        safe_read((char*)stripped_j + OFFSET_JOB_NAME, job_name, 23);
+        
+        if (strlen(job_name) > 2) {
+            SporkLog(@"Job: %s", job_name);
         }
-    } else {
-        in_hook_exec = 0;
-        SporkLog(@"CSE blocked the patch (Signal %d).", sig);
+
+        // Hook the first job that has a ScriptContext
+        void* sc = NULL;
+        if (safe_read((char*)stripped_j + OFFSET_JOB_SCRIPT_CTX, &sc, 8) && sc) {
+            void** original_vtable = *(void***)j;
+            orig_job_step = (job_step_t)original_vtable[0];
+            
+            void** new_vtable = (void**)malloc(0x1000);
+            memcpy(new_vtable, original_vtable, 0x1000);
+            new_vtable[0] = (void*)my_job_step;
+            
+            uintptr_t job_page = (uintptr_t)j & ~0x3FFF;
+            vm_protect(mach_task_self(), (vm_address_t)job_page, 0x4000, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+            *(void***)j = new_vtable;
+            vm_protect(mach_task_self(), (vm_address_t)job_page, 0x4000, false, VM_PROT_READ | VM_PROT_EXECUTE);
+            
+            SporkLog(@"Success: Hooked Job::step via VTable!");
+            return;
+        }
     }
 }
