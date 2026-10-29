@@ -47,21 +47,18 @@ static job_step_t orig_job_step = NULL;
 
 void my_job_step(void* job) {
     if (job) {
-        uintptr_t base = get_robloxlib_base();
+        // Removed the unused 'base' variable here.
         void* script_context = NULL;
         
         if (safe_read((char*)job + OFFSET_JOB_SCRIPT_CTX, &script_context, 8) && script_context) {
             script_context = (void*)STRIP_PAC(script_context);
             
-            // Log that we found a ScriptContext
             if (!g_live_L) {
                 SporkLog(@"Job::step triggered! Found SC: %p", script_context);
-                // We will just log the first few pointers in SC to see what's there
                 for (int i = 0; i < 0x4000; i += 8) {
                     uintptr_t ptr = 0;
                     if (safe_read((char*)script_context + i, &ptr, 8)) {
                         if (ptr > 0x100000000 && ptr < 0x400000000) {
-                            // Check if this looks like a lua_State (tt == 9 at +0x2)
                             uint8_t tt = 0;
                             if (safe_read((void*)(ptr + 2), &tt, 1) && tt == 9) {
                                 SporkLog(@"FOUND LUA STATE at offset 0x%X: %p", i, (void*)ptr);
@@ -121,12 +118,16 @@ void SetupHooks(void) {
             new_vtable[0] = (void*)my_job_step;
             
             uintptr_t job_page = (uintptr_t)j & ~0x3FFF;
-            vm_protect(mach_task_self(), (vm_address_t)job_page, 0x4000, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-            *(void***)j = new_vtable;
-            vm_protect(mach_task_self(), (vm_address_t)job_page, 0x4000, false, VM_PROT_READ | VM_PROT_EXECUTE);
-            
-            SporkLog(@"Success: Hooked Job::step via VTable!");
-            return;
+            kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)job_page, 0x4000, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+            if (kr == KERN_SUCCESS) {
+                *(void***)j = new_vtable;
+                vm_protect(mach_task_self(), (vm_address_t)job_page, 0x4000, false, VM_PROT_READ | VM_PROT_EXECUTE);
+                SporkLog(@"Success: Hooked Job::step via VTable!");
+                return;
+            } else {
+                SporkLog(@"Failed to protect memory for VTable hook: %d", kr);
+                free(new_vtable);
+            }
         }
     }
 }
