@@ -18,6 +18,7 @@
 #define STRIP_PAC_SCAN(ptr) ((uintptr_t)(ptr) & 0x0000000FFFFFFFFF)
 
 void* g_live_L = NULL;
+void* g_script_context = NULL; // Saves the real ScriptContext
 sigjmp_buf hook_jump_buffer;
 volatile sig_atomic_t in_hook_exec = 0;
 
@@ -54,70 +55,52 @@ static int hooked_job_count = 0;
 
 void my_job_step(void* job) {
     if (job && !g_live_L) {
-        char job_name[64] = {0};
-        safe_read((char*)job + OFFSET_JOB_NAME, job_name, 23);
+        void* script_context = g_script_context;
         
-        void* script_context = NULL;
-        safe_read((char*)job + OFFSET_JOB_SCRIPT_CTX, &script_context, 8);
-        
-        // Print EVERY job that ticks and has a valid script_context
-        if (script_context && (uintptr_t)script_context > 0x100000000) {
-            SporkLog(@"[TICK] Job: %s | SC: %p", strlen(job_name)>2?job_name:"Unknown", script_context);
+        // If we didn't find the global ScriptContext yet, fallback to this job's SC
+        if (!script_context) {
+            if (safe_read((char*)job + OFFSET_JOB_SCRIPT_CTX, &script_context, 8) && script_context) {
+                script_context = (void*)STRIP_PAC_SCAN(script_context);
+            }
         }
 
-        if (script_context && !g_live_L) {
-            script_context = (void*)STRIP_PAC_SCAN(script_context);
-            
-            if ((uintptr_t)script_context > 0x100000000 && (uintptr_t)script_context < 0x7FFFFFFFFFFF) {
-                
-                // Scan up to 32KB for the lua_State
-                for (int i = 0; i < 0x8000; i += 8) {
-                    uintptr_t ptr = 0;
-                    if (safe_read((char*)script_context + i, &ptr, 8)) {
-                        uintptr_t stripped_ptr = STRIP_PAC_SCAN(ptr);
-                        
-                        if (stripped_ptr > 0x100000000 && stripped_ptr < 0x7FFFFFFFFFFF) {
-                            uint8_t tt = 0;
-                            // Check for tt == 8 or 9 (Thread)
-                            if (safe_read((void*)(stripped_ptr + 2), &tt, 1) && (tt == 8 || tt == 9)) {
+        if (script_context && (uintptr_t)script_context > 0x100000000) {
+            // Scan up to 32KB for the lua_State
+            for (int i = 0; i < 0x8000; i += 8) {
+                uintptr_t ptr = 0;
+                if (safe_read((char*)script_context + i, &ptr, 8)) {
+                    uintptr_t stripped_ptr = STRIP_PAC_SCAN(ptr);
+                    
+                    if (stripped_ptr > 0x100000000 && stripped_ptr < 0x7FFFFFFFFFFF) {
+                        uint8_t tt = 0;
+                        // Check for tt == 8 or 9 (Thread)
+                        if (safe_read((void*)(stripped_ptr + 2), &tt, 1) && (tt == 8 || tt == 9)) {
+                            
+                            uintptr_t global_state = 0;
+                            if (safe_read((void*)(stripped_ptr + OFFSET_LUA_STATE_GLOBAL), &global_state, 8) && global_state) {
+                                global_state = STRIP_PAC_SCAN(global_state);
                                 
-                                SporkLog(@"[SCAN] Candidate LuaState at offset 0x%X: %p (tt=%d)", i, (void*)stripped_ptr, tt);
-                                
-                                uintptr_t global_state = 0;
-                                if (safe_read((void*)(stripped_ptr + OFFSET_LUA_STATE_GLOBAL), &global_state, 8) && global_state) {
-                                    global_state = STRIP_PAC_SCAN(global_state);
-                                    
-                                    if (global_state > 0x100000000 && global_state < 0x7FFFFFFFFFFF) {
-                                        SporkLog(@"[SCAN] -> Found Global State: %p", (void*)global_state);
+                                if (global_state > 0x100000000 && global_state < 0x7FFFFFFFFFFF) {
+                                    uintptr_t main_thread = 0;
+                                    if (safe_read((void*)(global_state + OFFSET_GLOBAL_STATE_MAIN), &main_thread, 8) && main_thread) {
+                                        main_thread = STRIP_PAC_SCAN(main_thread);
                                         
-                                        uintptr_t main_thread = 0;
-                                        if (safe_read((void*)(global_state + OFFSET_GLOBAL_STATE_MAIN), &main_thread, 8) && main_thread) {
-                                            main_thread = STRIP_PAC_SCAN(main_thread);
+                                        // Ensure it's a valid, 8-byte aligned pointer
+                                        if (main_thread > 0x100000000 && main_thread < 0x7FFFFFFFFFFF && (main_thread % 8 == 0)) {
                                             
-                                            // Ensure it's a valid, 8-byte aligned pointer
-                                            if (main_thread > 0x100000000 && main_thread < 0x7FFFFFFFFFFF && (main_thread % 8 == 0)) {
-                                                SporkLog(@"[SCAN] -> Found Main Thread: %p", (void*)main_thread);
+                                            // VERIFICATION: Ensure the main thread points back to this global_state
+                                            uintptr_t check_global = 0;
+                                            if (safe_read((void*)(main_thread + OFFSET_LUA_STATE_GLOBAL), &check_global, 8)) {
+                                                uintptr_t stripped_check = STRIP_PAC_SCAN(check_global);
                                                 
-                                                // VERIFICATION: Ensure the main thread points back to this global_state
-                                                uintptr_t check_global = 0;
-                                                if (safe_read((void*)(main_thread + OFFSET_LUA_STATE_GLOBAL), &check_global, 8)) {
-                                                    uintptr_t stripped_check = STRIP_PAC_SCAN(check_global);
+                                                if (stripped_check == global_state) {
+                                                    SporkLog(@"[SUCCESS] Valid Main Thread confirmed at %p!", (void*)main_thread);
+                                                    g_live_L = (void*)main_thread;
                                                     
-                                                    if (stripped_check == global_state) {
-                                                        SporkLog(@"[SUCCESS] Valid Main Thread confirmed at %p!", (void*)main_thread);
-                                                        g_live_L = (void*)main_thread;
-                                                        
-                                                        // Auto execute test script!
-                                                        ExecuteLuauBytecode("print(\"testing\")", 15);
-                                                        break;
-                                                    } else {
-                                                        SporkLog(@"[FAIL] Backlink mismatch: Expected %p, got %p", (void*)global_state, (void*)stripped_check);
-                                                    }
-                                                } else {
-                                                    SporkLog(@"[FAIL] Could not read backlink for MT: %p", (void*)main_thread);
+                                                    // Auto execute test script!
+                                                    ExecuteLuauBytecode("print(\"testing\")", 15);
+                                                    break;
                                                 }
-                                            } else {
-                                                SporkLog(@"[FAIL] Main thread is invalid or unaligned: %p", (void*)main_thread);
                                             }
                                         }
                                     }
@@ -160,11 +143,23 @@ void SetupHooks(void) {
     for (uintptr_t ptr = start; ptr < end; ptr += 0x10) {
         void* j = NULL;
         if (!safe_read((void*)ptr, &j, 8) || !j) continue;
+        uintptr_t stripped_j = STRIP_PAC_SCAN(j);
         
+        char job_name[64] = {0};
+        safe_read((char*)stripped_j + OFFSET_JOB_NAME, job_name, 23);
+        
+        // Look for the real ScriptContext job and save its pointer
+        if (strstr(job_name, "ScriptContextTaskQueue") || strstr(job_name, "WaitingHybridScriptsJob")) {
+            void* sc = NULL;
+            if (safe_read((char*)stripped_j + OFFSET_JOB_SCRIPT_CTX, &sc, 8) && sc) {
+                g_script_context = (void*)STRIP_PAC_SCAN(sc);
+                SporkLog(@"[HOOK] Found real ScriptContext via %s: %p", job_name, g_script_context);
+            }
+        }
+
         if (hooked_job_count < MAX_HOOKED_JOBS) {
             void** original_vtable = *(void***)j;
             
-            // Prevent double hooking
             if (original_vtable[0] == (void*)my_job_step) continue;
 
             orig_job_steps[hooked_job_count] = (job_step_t)original_vtable[0];
