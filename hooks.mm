@@ -4,15 +4,11 @@
 #import <string.h>
 #import <mach/mach.h>
 #import <mach/vm_map.h>
+#import <libkern/OSCacheControl.h>
 
-#define OFFSET_TASKSCHEDULER      0x6a6d7c0
-#define OFFSET_TS_JOBS_START      0xd0
-#define OFFSET_TS_JOBS_END        0xd8
-#define OFFSET_JOB_SCRIPT_CTX     0x1b0
-#define OFFSET_GET_GLOBAL_STATE   0x19ce768
-#define OFFSET_MAINTHREAD         0x1a0
-
-#define STRIP_PAC(ptr) ((uintptr_t)(ptr) & 0x0000000FFFFFFFFF)
+#define OFFSET_LUA_GETTOP         0x448e048
+#define OFFSET_LUA_STATE_TOP      0x70
+#define OFFSET_LUA_STATE_BASE     0x58
 
 void* g_live_L = NULL;
 sigjmp_buf hook_jump_buffer;
@@ -33,15 +29,16 @@ uintptr_t get_robloxlib_base(void) {
     return 0;
 }
 
-bool safe_read(void* address, void* buffer, size_t size) {
-    uintptr_t addr = STRIP_PAC(address);
-    if (addr < 0x100000000) return false; 
-    vm_size_t out_size;
-    kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)addr, (vm_size_t)size, (vm_address_t)buffer, &out_size);
-    return (kr == KERN_SUCCESS && out_size == size);
+// FAST hook: No syscalls, purely direct memory reads
+int my_lua_gettop(void* L) {
+    if (!g_live_L && L) {
+        g_live_L = L;
+        SporkLog(@"STOLE lua_State via lua_gettop: %p", L);
+    }
+    uintptr_t top = *(uintptr_t*)((uintptr_t)L + OFFSET_LUA_STATE_TOP);
+    uintptr_t base = *(uintptr_t*)((uintptr_t)L + OFFSET_LUA_STATE_BASE);
+    return (int)((top - base) / 16);
 }
-
-typedef void* (*get_global_state_t)(void* sc, int* identity, void** script);
 
 void SetupHooks(void) {
     signal(SIGSEGV, hook_signal_handler);
@@ -50,54 +47,37 @@ void SetupHooks(void) {
     uintptr_t base = get_robloxlib_base();
     if (!base) { SporkLog(@"RobloxLib not found."); return; }
 
-    void* task_scheduler = NULL;
-    if (!safe_read((void*)(base + OFFSET_TASKSCHEDULER), &task_scheduler, 8)) { SporkLog(@"TaskScheduler failed."); return; }
-    task_scheduler = (void*)STRIP_PAC(task_scheduler);
-
-    uintptr_t start = 0, end = 0;
-    safe_read((char*)task_scheduler + OFFSET_TS_JOBS_START, &start, 8);
-    safe_read((char*)task_scheduler + OFFSET_TS_JOBS_END, &end, 8);
-    start = STRIP_PAC(start); end = STRIP_PAC(end);
-
-    SporkLog(@"Scanning ALL Jobs for Lua VM...");
+    void* target = (void*)(base + OFFSET_LUA_GETTOP);
+    uint64_t my_func_addr = (uint64_t)my_lua_gettop;
     
-    get_global_state_t get_gs = (get_global_state_t)(base + OFFSET_GET_GLOBAL_STATE);
+    uint32_t patch[4] = {0x58000050, 0xD61F0200, (uint32_t)(my_func_addr & 0xFFFFFFFF), (uint32_t)(my_func_addr >> 32)};
+    uintptr_t page = (uintptr_t)target & ~0xFFF;
 
-    for (uintptr_t ptr = start; ptr < end; ptr += 0x10) {
-        void* j = NULL;
-        if (!safe_read((void*)ptr, &j, 8) || !j) continue;
-        uintptr_t stripped_j = STRIP_PAC(j);
-        
-        void* script_context = NULL;
-        if (!safe_read((char*)stripped_j + OFFSET_JOB_SCRIPT_CTX, &script_context, 8) || !script_context) {
-            continue;
-        }
-        
-        script_context = (void*)STRIP_PAC(script_context);
-
-        int id = 0; 
-        void* script = NULL;
-        
-        in_hook_exec = 1;
-        int sig = sigsetjmp(hook_jump_buffer, 1);
-        
-        if (sig == 0) {
-            void* global_state = get_gs(script_context, &id, &script);
-            in_hook_exec = 0;
-            
-            if (global_state) {
-                safe_read((char*)global_state + OFFSET_MAINTHREAD, &g_live_L, 8);
-                if (g_live_L) {
-                    SporkLog(@"SUCCESS! Found VM via Job at %p | lua_State: %p", j, g_live_L);
-                    ExecuteLuauBytecode("print(\"testing\")", 15);
-                    return;
-                }
-            }
-        } else {
-            in_hook_exec = 0;
-            // Crash caught, try next job
-        }
+    // 1. Suspend all other threads to prevent race conditions
+    thread_act_array_t threads;
+    mach_msg_type_number_t thread_count;
+    task_threads(mach_task_self(), &threads, &thread_count);
+    
+    thread_t current_thread = mach_thread_self();
+    for (mach_msg_type_number_t i = 0; i < thread_count; i++) {
+        if (threads[i] != current_thread) thread_suspend(threads[i]);
     }
 
-    SporkLog(@"Failed to find a valid Lua VM in any job.");
+    // 2. Patch memory (VM_PROT_COPY bypasses CSE)
+    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr == KERN_SUCCESS) {
+        memcpy(target, patch, 16);
+        sys_icache_invalidate(target, 16); // Flush CPU cache
+        vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, false, VM_PROT_READ | VM_PROT_EXECUTE);
+        SporkLog(@"Hooked lua_gettop successfully.");
+    } else {
+        SporkLog(@"vm_protect failed: %d", kr);
+    }
+
+    // 3. Resume threads
+    for (mach_msg_type_number_t i = 0; i < thread_count; i++) {
+        if (threads[i] != current_thread) thread_resume(threads[i]);
+        mach_port_deallocate(mach_task_self(), threads[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)threads, sizeof(thread_t) * thread_count);
 }
