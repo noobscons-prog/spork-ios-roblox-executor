@@ -9,13 +9,12 @@ bool g_is_injected = true;
 int g_execution_method = 1;
 NSMutableArray<NSString *> *g_logs = nil;
 
-static NSString *getLogPath(NSString *filename) {
-    NSString *documents = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *logsDir = [documents stringByAppendingPathComponent:@"SporkLogs"];
+static NSString *getLogPath() {
+    NSString *logsDir = @"/var/mobile/Documents/SporkLogs";
     if (![[NSFileManager defaultManager] fileExistsAtPath:logsDir]) {
         [[NSFileManager defaultManager] createDirectoryAtPath:logsDir withIntermediateDirectories:YES attributes:nil error:nil];
     }
-    return [logsDir stringByAppendingPathComponent:filename];
+    return [logsDir stringByAppendingPathComponent:@"execution_logs.txt"];
 }
 
 void SporkLog(NSString *format, ...) {
@@ -30,7 +29,7 @@ void SporkLog(NSString *format, ...) {
     [formatter setDateFormat:@"HH:mm:ss"];
     NSString *logLine = [NSString stringWithFormat:@"[%@] %@\n", [formatter stringFromDate:[NSDate date]], msg];
     
-    NSString *path = getLogPath(@"execution_logs.txt");
+    NSString *path = getLogPath();
     NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:path];
     if (fileHandle) {
         [fileHandle seekToEndOfFile];
@@ -45,13 +44,6 @@ void SporkLog(NSString *format, ...) {
         [g_logs addObject:[logLine stringByTrimmingCharactersInSet:[NSCharacterSet newlineCharacterSet]]];
         [[NSNotificationCenter defaultCenter] postNotificationName:@"SporkLogUpdated" object:nil];
     });
-}
-
-void uncaught_exception_handler(NSException *exception) {
-    NSString *crashLog = [NSString stringWithFormat:@"CRASH: %@\nReason: %@\nStack: %@\n", exception.name, exception.reason, exception.callStackSymbols];
-    NSString *path = getLogPath(@"crash_logs.txt");
-    [crashLog writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    SporkLog(@"App crashed: %@", exception.name);
 }
 
 typedef int (*lua_pcall_t)(void* L, int nargs, int nresults, int errfunc);
@@ -90,7 +82,7 @@ void ExecuteLuauBytecode(const char* source, size_t size) {
         in_hook_exec = 0;
     } else {
         in_hook_exec = 0;
-        SporkLog(@"CRASH CAUGHT during execution: Signal %d", sig);
+        SporkLog(@"CRASH CAUGHT: Signal %d", sig);
     }
 }
 
@@ -118,7 +110,7 @@ static PassThroughWindow *overlayWindow = nil;
 
 __attribute__((constructor))
 static void init() {
-    NSSetUncaughtExceptionHandler(&uncaught_exception_handler);
+    SporkLog(@"Spork injected. Starting UI...");
     
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (overlayWindow) return; 
@@ -149,19 +141,11 @@ static void init() {
         overlayWindow.interactableView1 = vc.mainContainer;
         overlayWindow.interactableView2 = vc.floatingButton;
         
-        SporkLog(@"UI loaded. Waiting 3 seconds for game to stabilize...");
+        SporkLog(@"UI loaded. Waiting 2 seconds...");
         
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            SporkLog(@"Starting setup hooks...");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            SporkLog(@"Starting SetupHooks...");
             SetupHooks();
-            
-            [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
-                if (g_live_L) {
-                    SporkLog(@"SUCCESS! Stole lua_State: %p", g_live_L);
-                    [timer invalidate];
-                    ExecuteLuauBytecode("print(\"testing\")", 15);
-                }
-            }];
         });
     });
 }
