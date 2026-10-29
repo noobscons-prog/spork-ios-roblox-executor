@@ -48,7 +48,7 @@ static job_step_t orig_job_step = NULL;
 static bool logged_sc = false;
 
 void my_job_step(void* job) {
-    // Only scan if we haven't found L yet
+    // Only scan if we haven't found L yet.
     if (job && !g_live_L) {
         void* script_context = NULL;
         
