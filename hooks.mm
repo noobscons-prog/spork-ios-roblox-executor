@@ -12,9 +12,6 @@
 #define OFFSET_JOB_NAME           0x18
 #define OFFSET_JOB_SCRIPT_CTX     0x1b0
 
-#define OFFSET_LUA_STATE_GLOBAL   0x78
-#define OFFSET_GLOBAL_STATE_MAIN  0x1a0
-
 #define STRIP_PAC_SCAN(ptr) ((uintptr_t)(ptr) & 0x0000000FFFFFFFFF)
 
 void* g_live_L = NULL;
@@ -57,17 +54,42 @@ bool FindLuaState(void) {
                 safe_read((char*)task_scheduler + OFFSET_TS_JOBS_END, &end, 8);
                 start = STRIP_PAC_SCAN(start); end = STRIP_PAC_SCAN(end);
                 
+                // 1. Prioritize WaitingHybridScriptsJob
                 for (uintptr_t ptr = start; ptr < end; ptr += 0x10) {
                     void* j = NULL;
                     if (!safe_read((void*)ptr, &j, 8) || !j) continue;
                     uintptr_t stripped_j = STRIP_PAC_SCAN(j);
-                    void* sc = NULL;
-                    if (safe_read((char*)stripped_j + OFFSET_JOB_SCRIPT_CTX, &sc, 8) && sc) {
-                        sc = (void*)STRIP_PAC_SCAN(sc);
-                        // STRICT CHECK: Must be a valid memory address
-                        if ((uintptr_t)sc > 0x100000000 && (uintptr_t)sc < 0x7FFFFFFFFFFF) {
-                            g_script_context = sc;
-                            break;
+                    
+                    char job_name[64] = {0};
+                    safe_read((char*)stripped_j + OFFSET_JOB_NAME, job_name, 23);
+                    
+                    if (strstr(job_name, "WaitingHybridScriptsJob")) {
+                        void* sc = NULL;
+                        if (safe_read((char*)stripped_j + OFFSET_JOB_SCRIPT_CTX, &sc, 8) && sc) {
+                            sc = (void*)STRIP_PAC_SCAN(sc);
+                            if ((uintptr_t)sc > 0x100000000 && (uintptr_t)sc < 0x7FFFFFFFFFFF) {
+                                g_script_context = sc;
+                                SporkLog(@"[FIND] Found SC via WaitingHybridScriptsJob: %p", g_script_context);
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                // 2. Fallback to any valid SC
+                if (!g_script_context) {
+                    for (uintptr_t ptr = start; ptr < end; ptr += 0x10) {
+                        void* j = NULL;
+                        if (!safe_read((void*)ptr, &j, 8) || !j) continue;
+                        uintptr_t stripped_j = STRIP_PAC_SCAN(j);
+                        void* sc = NULL;
+                        if (safe_read((char*)stripped_j + OFFSET_JOB_SCRIPT_CTX, &sc, 8) && sc) {
+                            sc = (void*)STRIP_PAC_SCAN(sc);
+                            if ((uintptr_t)sc > 0x100000000 && (uintptr_t)sc < 0x7FFFFFFFFFFF) {
+                                g_script_context = sc;
+                                SporkLog(@"[FIND] Fallback SC: %p", g_script_context);
+                                break;
+                            }
                         }
                     }
                 }
@@ -82,31 +104,34 @@ bool FindLuaState(void) {
         if (safe_read((char*)g_script_context + i, &ptr, 8)) {
             uintptr_t stripped_ptr = STRIP_PAC_SCAN(ptr);
             
-            if (stripped_ptr > 0x100000000 && stripped_ptr < 0x7FFFFFFFFFFF) {
+            if (stripped_ptr > 0x100000000 && stripped_ptr < 0x7FFFFFFFFFFF && (stripped_ptr % 8 == 0)) {
                 uint8_t tt = 0;
-                // Only accept tt == 9 (Thread)
+                // ONLY accept tt == 9 (Thread)
                 if (safe_read((void*)(stripped_ptr + 2), &tt, 1) && tt == 9) {
+                    
+                    uintptr_t stack = 0;
                     uintptr_t global_state = 0;
-                    if (safe_read((void*)(stripped_ptr + OFFSET_LUA_STATE_GLOBAL), &global_state, 8) && global_state) {
+                    
+                    // Verify lua_State pointers
+                    if (safe_read((void*)(stripped_ptr + 0x60), &stack, 8) && stack &&
+                        safe_read((void*)(stripped_ptr + 0x78), &global_state, 8) && global_state) {
+                        
+                        stack = STRIP_PAC_SCAN(stack);
                         global_state = STRIP_PAC_SCAN(global_state);
                         
-                        if (global_state > 0x100000000 && global_state < 0x7FFFFFFFFFFF) {
-                            uintptr_t main_thread = 0;
-                            if (safe_read((void*)(global_state + OFFSET_GLOBAL_STATE_MAIN), &main_thread, 8) && main_thread) {
-                                main_thread = STRIP_PAC_SCAN(main_thread);
-                                
-                                if (main_thread > 0x100000000 && main_thread < 0x7FFFFFFFFFFF && (main_thread % 8 == 0)) {
-                                    uintptr_t check_global = 0;
-                                    if (safe_read((void*)(main_thread + OFFSET_LUA_STATE_GLOBAL), &check_global, 8)) {
-                                        uintptr_t stripped_check = STRIP_PAC_SCAN(check_global);
-                                        
-                                        if (stripped_check == global_state) {
-                                            SporkLog(@"[FIND] Valid Main Thread confirmed at %p!", (void*)main_thread);
-                                            g_live_L = (void*)main_thread;
-                                            return true;
-                                        }
-                                    }
-                                }
+                        if (stack > 0x100000000 && stack < 0x7FFFFFFFFFFF && (stack % 8 == 0) &&
+                            global_state > 0x100000000 && global_state < 0x7FFFFFFFFFFF && (global_state % 8 == 0)) {
+                            
+                            // Verify global_state stringtable
+                            uint32_t size = 0;
+                            uint32_t nuse = 0;
+                            safe_read((void*)(global_state + 0x8), &nuse, 4);
+                            safe_read((void*)(global_state + 0xc), &size, 4);
+                            
+                            if (size > 0 && (size & (size - 1)) == 0 && nuse <= size) {
+                                SporkLog(@"[FIND] Valid LuaState verified at %p!", (void*)stripped_ptr);
+                                g_live_L = (void*)stripped_ptr;
+                                return true;
                             }
                         }
                     }
@@ -158,19 +183,7 @@ void SetupHooks(void) {
     for (uintptr_t ptr = start; ptr < end; ptr += 0x10) {
         void* j = NULL;
         if (!safe_read((void*)ptr, &j, 8) || !j) continue;
-        uintptr_t stripped_j = STRIP_PAC_SCAN(j);
         
-        void* sc = NULL;
-        if (safe_read((char*)stripped_j + OFFSET_JOB_SCRIPT_CTX, &sc, 8) && sc) {
-            sc = (void*)STRIP_PAC_SCAN(sc);
-            if ((uintptr_t)sc > 0x100000000 && (uintptr_t)sc < 0x7FFFFFFFFFFF) {
-                if (!g_script_context) {
-                    g_script_context = sc;
-                    SporkLog(@"[HOOK] Found initial ScriptContext: %p", g_script_context);
-                }
-            }
-        }
-
         if (hooked_job_count < MAX_HOOKED_JOBS) {
             void** original_vtable = *(void***)j;
             
@@ -194,5 +207,5 @@ void SetupHooks(void) {
             }
         }
     }
-    SporkLog(@"Hooked %d jobs. SC: %p", hooked_job_count, g_script_context);
+    SporkLog(@"Hooked %d jobs.", hooked_job_count);
 }
