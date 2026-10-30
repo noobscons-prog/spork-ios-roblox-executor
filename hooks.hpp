@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define OFFSET_LUAU_COMPILE 0x0 
+#define OFFSET_LUAU_COMPILE 0x0
 #define OFFSET_LUAU_LOAD 0x44bc110
 #define OFFSET_LUA_PCALL 0x4490fec
 #define OFFSET_LUA_NEWTHREAD 0x448df3c
@@ -29,8 +29,16 @@ void SetupHooks(void);
 uintptr_t get_robloxlib_base(void);
 void ExecuteLuauBytecode(const char* source, size_t size);
 void hook_signal_handler(int sig);
-bool FindLuaState(void);
+bool safe_read(void* address, void* buffer, size_t size);
 
 #ifdef __cplusplus
 }
 #endif
+
+// Inline helpers usable from any TU
+static inline uintptr_t spork_strip_pac(uintptr_t p) {
+    return p & 0x0000FFFFFFFFFFFFULL;
+}
+static inline bool spork_is_valid_ptr(uintptr_t p) {
+    return p > 0x100000000ULL && p < 0x0000FFFFFFFFFFFFULL;
+}
