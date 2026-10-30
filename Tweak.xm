@@ -1,9 +1,13 @@
 #import <UIKit/UIKit.h>
 #import <signal.h>
 #import <setjmp.h>
+#import <string.h>
 #import <Foundation/Foundation.h>
 #import "SporkUI.h"
 #import "hooks.hpp"
+
+// safe_read is defined (non-static) in hooks.mm
+extern bool safe_read(void* address, void* buffer, size_t size);
 
 bool g_is_injected = true;
 int g_execution_method = 1;
@@ -58,19 +62,26 @@ void ExecuteLuauBytecode(const char* source, size_t size) {
     }
 
     uintptr_t base = get_robloxlib_base();
-    luau_load_t        luau_load        = (luau_load_t)(base + 0x44bc110);
-    lua_pcall_t        lua_pcall        = (lua_pcall_t)(base + 0x4490fec);
-    lua_newthread_t    lua_newthread    = (lua_newthread_t)(base + 0x448df3c);
+    luau_load_t          luau_load          = (luau_load_t)(base + 0x44bc110);
+    lua_pcall_t          lua_pcall          = (lua_pcall_t)(base + 0x4490fec);
+    lua_newthread_t      lua_newthread      = (lua_newthread_t)(base + 0x448df3c);
     luaL_sandboxthread_t luaL_sandboxthread = (luaL_sandboxthread_t)(base + 0x1a12ad4);
 
-    SporkLog(@"Exec: base=0x%lx L=%p luau_load=0x%lx pcall=0x%lx newthread=0x%lx sandbox=0x%lx",
-             (unsigned long)base, g_live_L,
-             (unsigned long)(base + 0x44bc110),
-             (unsigned long)(base + 0x4490fec),
-             (unsigned long)(base + 0x448df3c),
-             (unsigned long)(base + 0x1a12ad4));
-    SporkLog(@"Executing script on L: %p (size=%zu)", g_live_L, size);
+    SporkLog(@"Exec: L=%p base=0x%lx size=%zu", g_live_L, (unsigned long)base, size);
 
+    // Preflight: ARM64 function prologue of lua_newthread should look like
+    // stp x29, x30, [sp, #-16]!  →  FD 7B BF A9
+    uint8_t nb[8] = {0};
+    if (safe_read((void*)(uintptr_t)lua_newthread, nb, sizeof(nb))) {
+        bool ok = (nb[0] == 0xFD && nb[1] == 0x7B);
+        SporkLog(@"newthread @ %p: %02x %02x %02x %02x %02x %02x %02x %02x %s",
+                 lua_newthread,
+                 nb[0], nb[1], nb[2], nb[3], nb[4], nb[5], nb[6], nb[7],
+                 ok ? "(prologue OK)" : "(SUSPICIOUS — offset may be wrong)");
+    }
+
+    // ===== Attempt 1: newthread → sandbox → load → pcall =====
+    SporkLog(@"--- Attempt 1: newthread + sandbox + load + pcall ---");
     in_hook_exec = 1;
     int sig = sigsetjmp(hook_jump_buffer, 1);
     if (sig == 0) {
@@ -82,21 +93,52 @@ void ExecuteLuauBytecode(const char* source, size_t size) {
             SporkLog(@"luau_load status=%d", status);
             if (status == 0) {
                 int ret = lua_pcall(new_L, 0, 0, 0);
-                SporkLog(@"pcall returned %d", ret);
-                if (ret == 0) SporkLog(@"Executed successfully!");
-                else          SporkLog(@"pcall error (ret=%d)", ret);
-            } else {
-                SporkLog(@"luau_load failed. Status: %d", status);
+                SporkLog(@"pcall ret=%d", ret);
+                if (ret == 0) {
+                    SporkLog(@"SUCCESS (attempt 1): script executed!");
+                    in_hook_exec = 0;
+                    return;
+                }
             }
         } else {
-            SporkLog(@"lua_newthread returned NULL — OFFSET_LUA_NEWTHREAD (0x448df3c) may be stale.");
+            SporkLog(@"lua_newthread returned NULL — offset 0x448df3c may be wrong.");
         }
         in_hook_exec = 0;
-    } else {
-        in_hook_exec = 0;
-        SporkLog(@"CRASH CAUGHT: Signal %d", sig);
+        SporkLog(@"Attempt 1 did not crash — offsets are valid but call returned an error. Not retrying.");
+        return;
     }
+
+    // Attempt 1 crashed
+    in_hook_exec = 0;
+    SporkLog(@"Attempt 1 CRASHED (signal %d) — trying direct-load fallback", sig);
+
+    // ===== Attempt 2: luau_load directly on g_live_L → pcall =====
+    SporkLog(@"--- Attempt 2: direct luau_load on L + pcall ---");
+    in_hook_exec = 1;
+    sig = sigsetjmp(hook_jump_buffer, 1);
+    if (sig == 0) {
+        int status = luau_load(g_live_L, "SporkScript", source, size, 0);
+        SporkLog(@"luau_load(direct) status=%d", status);
+        if (status == 0) {
+            int ret = lua_pcall(g_live_L, 0, 0, 0);
+            SporkLog(@"pcall(direct) ret=%d", ret);
+            if (ret == 0) {
+                SporkLog(@"SUCCESS (attempt 2): script executed!");
+                in_hook_exec = 0;
+                return;
+            }
+        }
+        in_hook_exec = 0;
+        return;
+    }
+
+    // Attempt 2 crashed
+    in_hook_exec = 0;
+    SporkLog(@"Attempt 2 CRASHED (signal %d) — giving up. Clearing g_live_L.", sig);
+    g_live_L = NULL;
 }
+
+// --- Everything below this line is UNCHANGED from your original Tweak.xm ---
 
 @interface PassThroughWindow : UIWindow
 @property (nonatomic, weak) UIView *interactableView1;
