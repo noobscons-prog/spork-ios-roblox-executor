@@ -6,13 +6,17 @@
 #import <mach/vm_map.h>
 #import <libkern/OSCacheControl.h>
 
-#define OFFSET_LUAU_LOAD 0x44bc110
-
 void* g_live_L = NULL;
+sigjmp_buf hook_jump_buffer;
+volatile sig_atomic_t in_hook_exec = 0;
 
 extern void SporkLog(NSString *format, ...);
 extern void ExecuteLuauBytecode(const char* source, size_t size);
 extern const char* g_gui_script;
+
+void hook_signal_handler(int sig) {
+    if (in_hook_exec) siglongjmp(hook_jump_buffer, sig);
+}
 
 uintptr_t get_robloxlib_base(void) {
     uint32_t count = _dyld_image_count();
@@ -23,88 +27,83 @@ uintptr_t get_robloxlib_base(void) {
     return 0;
 }
 
-static uint8_t* trampoline_load = NULL;
-static bool g_is_executing = false;
-
-int my_luau_load_hook(void* L, const char* chunkname, const char* data, size_t size, int env) {
-    if (!g_live_L && L && !g_is_executing) {
-        g_live_L = L;
-        SporkLog(@"CAPTURED REAL L from luau_load: %p", L);
-        
-        dispatch_async(dispatch_get_main_queue(), ^{
-            SporkLog(@"Executing GUI payload...");
-            ExecuteLuauBytecode(g_gui_script, strlen(g_gui_script));
-        });
-    }
-    
-    typedef int (*orig_load_t)(void*, const char*, const char*, size_t, int);
-    orig_load_t orig = (orig_load_t)trampoline_load;
-    return orig(L, chunkname, data, size, env);
-}
-
-void install_hook(uintptr_t target_addr, void* hook_func) {
-    kern_return_t kr;
-    uintptr_t target = target_addr & 0x0000FFFFFFFFFFFF;
-    uintptr_t page = target & ~0x3FFF;
-    
-    SporkLog(@"Hooking 0x%lx, page 0x%lx", target, page);
-    
-    kr = vm_protect(mach_task_self(), page, 0x4000, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    if (kr != KERN_SUCCESS) {
-        SporkLog(@"vm_protect RW failed: %d", kr);
-        return;
-    }
-
-    vm_address_t tramp_mem = 0;
-    kr = vm_allocate(mach_task_self(), &tramp_mem, 0x4000, VM_FLAGS_ANYWHERE);
-    if (kr != KERN_SUCCESS) {
-        SporkLog(@"vm_allocate failed: %d", kr);
-        return;
-    }
-    vm_protect(mach_task_self(), tramp_mem, 0x4000, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-
-    uint8_t* tramp = (uint8_t*)tramp_mem;
-    
-    // 1. Copy original 24 bytes
-    for (int i = 0; i < 24; i++) tramp[i] = ((uint8_t*)target)[i];
-    
-    // 2. Append jump back to target+24
-    uint8_t jump_back[16] = {
-        0x3F, 0x43, 0xC1, 0xDA, // xpaci x16 (strip PAC)
-        0x50, 0x00, 0x00, 0x58, // ldr x16, #8 (load jump address)
-        0x00, 0x02, 0x1F, 0xD6, // br x16
-        0, 0, 0, 0
-    };
-    for (int i = 0; i < 16; i++) tramp[24 + i] = jump_back[i];
-    *(uintptr_t*)(tramp + 24 + 8) = target + 24;
-
-    // 3. Prepare patch (Exactly 24 bytes)
-    uint8_t patch[24] = {
-        0x3F, 0x43, 0xC1, 0xDA, // xpaci x16
-        0x50, 0x00, 0x00, 0x58, // ldr x16, #8
-        0x00, 0x02, 0x1F, 0xD6, // br x16
-        0, 0, 0, 0, 0, 0, 0, 0, // 8-byte target address placeholder
-        0x1F, 0x20, 0x03, 0xD5  // nop (Padding to 24 bytes)
-    };
-    // Write our C function pointer into the payload
-    *(uintptr_t*)(patch + 12) = (uintptr_t)hook_func;
-
-    // 4. Apply patch to memory
-    for (int i = 0; i < 24; i++) ((uint8_t*)target)[i] = patch[i];
-    
-    // 5. Flush caches & restore RX protection
-    vm_protect(mach_task_self(), page, 0x4000, false, VM_PROT_READ | VM_PROT_EXECUTE);
-    sys_icache_invalidate((void*)target, 24);
-    sys_icache_invalidate(tramp, 40);
-    
-    trampoline_load = tramp;
-    SporkLog(@"Inline hook installed safely.");
+bool safe_read(void* address, void* buffer, size_t size) {
+    uintptr_t addr = spork_strip_pac((uintptr_t)address);
+    if (addr < 0x100000000) return false;
+    vm_size_t out_size;
+    kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                                         (vm_address_t)addr,
+                                         (vm_size_t)size,
+                                         (vm_address_t)buffer,
+                                         &out_size);
+    return (kr == KERN_SUCCESS && out_size == size);
 }
 
 void SetupHooks(void) {
-    SporkLog(@"SetupHooks starting...");
+    signal(SIGSEGV, hook_signal_handler);
+    signal(SIGBUS,  hook_signal_handler);
+
     uintptr_t base = get_robloxlib_base();
     if (!base) { SporkLog(@"RobloxLib not found."); return; }
 
-    install_hook(base + OFFSET_LUAU_LOAD, (void*)my_luau_load_hook);
+    SporkLog(@"Using direct offsets from dump...");
+
+    // Method 1: get_global_state -> mainthread (Instant and 100% accurate)
+    typedef void* (*get_gs_t)();
+    get_gs_t get_gs = (get_gs_t)(base + 0x19ce768);
+    void* gs = get_gs();
+    
+    if (gs) {
+        uintptr_t L = 0;
+        // global_State::mainthread is at 0x1A0
+        if (safe_read((void*)((uintptr_t)gs + 0x1A0), &L, 8)) {
+            L = spork_strip_pac(L);
+            if (spork_is_valid_ptr(L)) {
+                g_live_L = (void*)L;
+                SporkLog(@"Found L via get_global_state(): %p", L);
+            }
+        }
+    }
+
+    // Method 2: get_scriptcontext -> scan for L (Fallback)
+    if (!g_live_L) {
+        typedef void* (*get_sc_t)();
+        get_sc_t get_sc = (get_sc_t)(base + 0x19cc48c);
+        void* sc = get_sc();
+        
+        if (sc) {
+            SporkLog(@"Found ScriptContext via get_scriptcontext(): %p", sc);
+            // Scan SC for a valid lua_State using exact dumped offsets (0x78 -> 0x1A0)
+            for (size_t i = 0; i < 0x8000; i += 8) {
+                uintptr_t cand = 0;
+                if (!safe_read((char*)sc + i, &cand, 8)) continue;
+                cand = spork_strip_pac(cand);
+                if (!spork_is_valid_ptr(cand)) continue;
+
+                uintptr_t cand_gs = 0;
+                if (safe_read((void*)(cand + 0x78), &cand_gs, 8)) {
+                    cand_gs = spork_strip_pac(cand_gs);
+                    if (spork_is_valid_ptr(cand_gs)) {
+                        uintptr_t mt = 0;
+                        if (safe_read((void*)(cand_gs + 0x1A0), &mt, 8) && spork_strip_pac(mt) == cand) {
+                            g_live_L = (void*)cand;
+                            SporkLog(@"Found canonical L via get_scriptcontext: %p", cand);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (g_live_L) {
+        SporkLog(@"SUCCESS: g_live_L is set! Auto-injecting GUI in 3 seconds...");
+        
+        // Wait 3 seconds so the game finishes loading before we inject, preventing a race condition.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            ExecuteLuauBytecode(g_gui_script, strlen(g_gui_script));
+        });
+    } else {
+        SporkLog(@"ERROR: Could not find lua_State.");
+    }
 }
