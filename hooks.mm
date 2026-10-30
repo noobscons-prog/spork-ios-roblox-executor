@@ -16,6 +16,7 @@ volatile sig_atomic_t in_hook_exec = 0;
 
 extern void SporkLog(NSString *format, ...);
 extern void ExecuteLuauBytecode(const char* source, size_t size);
+extern const char* g_gui_script; // Extern from Tweak.xm
 
 void hook_signal_handler(int sig) {
     if (in_hook_exec) siglongjmp(hook_jump_buffer, sig);
@@ -42,17 +43,16 @@ bool safe_read(void* address, void* buffer, size_t size) {
     return (kr == KERN_SUCCESS && out_size == size);
 }
 
-// Blacklist to skip fake Ls that crash during execution
 static uintptr_t g_bad_Ls[16] = {0};
 static int g_num_bad = 0;
 
 static bool find_L_offsets(uintptr_t cand, int *out_ls, int *out_gs) {
     for (int j = 0; j < g_num_bad; j++) {
-        if (cand == g_bad_Ls[j]) return false; // Skip blacklisted
+        if (cand == g_bad_Ls[j]) return false;
     }
 
     static const struct { int ls; int gs; } pairs[] = {
-        {0x78, 0x1a0}, // Standard PC
+        {0x78, 0x1a0}, 
         {0x78, 0x1b0}, 
         {0x78, 0x1b8}, 
         {0x70, 0x1a0}, 
@@ -60,7 +60,7 @@ static bool find_L_offsets(uintptr_t cand, int *out_ls, int *out_gs) {
         {0x68, 0x1a0}, 
         {0x68, 0x1b0}, 
         {0x60, 0x1a0}, 
-        {0x60, 0x1b0}, // Seen in logs (likely fake)
+        {0x60, 0x1b0}, 
         {0x58, 0x1a0}, 
         {0x58, 0x1b0}, 
     };
@@ -71,7 +71,7 @@ static bool find_L_offsets(uintptr_t cand, int *out_ls, int *out_gs) {
         gs = spork_strip_pac(gs);
         
         if (!spork_is_valid_ptr(gs) || gs == cand) continue;
-        if ((gs >> 48) == 0x99) continue; // NaN check
+        if ((gs >> 48) == 0x99) continue;
         
         uintptr_t mt = 0;
         if (!safe_read((void*)(gs + pairs[i].gs), &mt, 8)) continue;
@@ -149,24 +149,24 @@ void my_job_step(void *job) {
 
         if (found) {
             g_live_L = (void*)found;
-            SporkLog(@"Set g_live_L = %p. Auto-testing...", g_live_L);
+            SporkLog(@"Set g_live_L = %p. Auto-injecting GUI...", g_live_L);
             
-            // Auto execute to test the pipeline
-            ExecuteLuauBytecode("print(\"testing from Spork\")", 27);
+            // Execute the GUI script instead of a simple print
+            ExecuteLuauBytecode(g_gui_script, strlen(g_gui_script));
             
             if (!g_live_L) {
                 // It failed or crashed (Tweak.xm caught the signal and cleared L)
                 if (g_num_bad < 16) g_bad_Ls[g_num_bad++] = found;
-                SporkLog(@"Execution failed/crashed for %p. Blacklisted. Will try next candidate in 1s.", (void*)found);
-                g_last_scan_tick = g_tick_count - 240; // Retry in 60 ticks (1s)
+                SporkLog(@"Execution crashed for %p. Blacklisted. Will try next candidate in 1s.", (void*)found);
+                g_last_scan_tick = g_tick_count - 240; 
                 
                 if (g_scan_attempt >= 15) {
                     SporkLog(@"Giving up after %d attempts.", g_scan_attempt);
                     g_given_up = true;
                 }
             } else {
-                SporkLog(@"SUCCESS: Execution pipeline works! You can now execute scripts.");
-                g_given_up = true; // Stop scanning, we are done
+                SporkLog(@"SUCCESS: GUI Injected! Check your Roblox screen.");
+                g_given_up = true; 
             }
         } else if (g_scan_attempt >= 5) {
             SporkLog(@"Giving up after %d attempts.", g_scan_attempt);
@@ -238,7 +238,6 @@ void SetupHooks(void) {
         return;
     }
 
-    // Hook the LAST instance (which was ticking and had valid SC in the 08:18 log)
     uintptr_t hj = hybrid_jobs[num_hybrid - 1];
     SporkLog(@"Hooking vtable of WaitingHybridScriptsJob[%d] @ %p", num_hybrid - 1, (void*)hj);
     void **original_vtable = *(void ***)hj;
