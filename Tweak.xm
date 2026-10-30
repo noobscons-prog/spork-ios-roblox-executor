@@ -6,12 +6,49 @@
 #import "SporkUI.h"
 #import "hooks.hpp"
 
-// safe_read is defined (non-static) in hooks.mm
 extern bool safe_read(void* address, void* buffer, size_t size);
 
 bool g_is_injected = true;
 int g_execution_method = 1;
 NSMutableArray<NSString *> *g_logs = nil;
+
+// The GUI payload we will inject into Roblox
+static const char* g_gui_script = 
+    "local ScreenGui = Instance.new('ScreenGui') "
+    "local Main = Instance.new('Frame') "
+    "local TextBox = Instance.new('TextBox') "
+    "local Execute = Instance.new('TextButton') "
+    "local Title = Instance.new('TextLabel') "
+    "ScreenGui.Parent = game:GetService('Players').LocalPlayer:WaitForChild('PlayerGui') "
+    "ScreenGui.Name = 'SporkGUI' "
+    "Main.Parent = ScreenGui "
+    "Main.Size = UDim2.new(0, 300, 0, 200) "
+    "Main.Position = UDim2.new(0.5, -150, 0.5, -100) "
+    "Main.BackgroundColor3 = Color3.fromRGB(30, 30, 30) "
+    "Main.BorderSizePixel = 0 "
+    "Title.Parent = Main "
+    "Title.Size = UDim2.new(1, 0, 0, 30) "
+    "Title.BackgroundColor3 = Color3.fromRGB(40, 40, 40) "
+    "Title.Text = 'Spork In-Game' "
+    "Title.TextColor3 = Color3.fromRGB(255, 255, 255) "
+    "Title.Font = Enum.Font.SourceSansBold "
+    "TextBox.Parent = Main "
+    "TextBox.Size = UDim2.new(1, -20, 1, -80) "
+    "TextBox.Position = UDim2.new(0, 10, 0, 40) "
+    "TextBox.BackgroundColor3 = Color3.fromRGB(20, 20, 20) "
+    "TextBox.TextColor3 = Color3.fromRGB(0, 255, 0) "
+    "TextBox.MultiLine = true "
+    "Execute.Parent = Main "
+    "Execute.Size = UDim2.new(1, -20, 0, 30) "
+    "Execute.Position = UDim2.new(0, 10, 1, -40) "
+    "Execute.BackgroundColor3 = Color3.fromRGB(0, 120, 255) "
+    "Execute.Text = 'Execute' "
+    "Execute.TextColor3 = Color3.fromRGB(255, 255, 255) "
+    "Execute.MouseButton1Click:Connect(function() "
+    "local func, err = loadstring(TextBox.Text) "
+    "if func then pcall(func) else TextBox.Text = 'Error: ' .. tostring(err) end "
+    "end) "
+    "print('Spork GUI injected successfully!')";
 
 static NSString *getLogPath() {
     NSString *logsDir = @"/var/mobile/Documents/SporkLogs";
@@ -69,18 +106,7 @@ void ExecuteLuauBytecode(const char* source, size_t size) {
 
     SporkLog(@"Exec: L=%p base=0x%lx size=%zu", g_live_L, (unsigned long)base, size);
 
-    // Preflight: ARM64 function prologue of lua_newthread should look like
-    // stp x29, x30, [sp, #-16]!  →  FD 7B BF A9
-    uint8_t nb[8] = {0};
-    if (safe_read((void*)(uintptr_t)lua_newthread, nb, sizeof(nb))) {
-        bool ok = (nb[0] == 0xFD && nb[1] == 0x7B);
-        SporkLog(@"newthread @ %p: %02x %02x %02x %02x %02x %02x %02x %02x %s",
-                 lua_newthread,
-                 nb[0], nb[1], nb[2], nb[3], nb[4], nb[5], nb[6], nb[7],
-                 ok ? "(prologue OK)" : "(SUSPICIOUS — offset may be wrong)");
-    }
-
-    // ===== Attempt 1: newthread → sandbox → load → pcall =====
+    // ===== Attempt 1: newthread -> sandbox -> load -> pcall =====
     SporkLog(@"--- Attempt 1: newthread + sandbox + load + pcall ---");
     in_hook_exec = 1;
     int sig = sigsetjmp(hook_jump_buffer, 1);
@@ -101,10 +127,9 @@ void ExecuteLuauBytecode(const char* source, size_t size) {
                 }
             }
         } else {
-            SporkLog(@"lua_newthread returned NULL — offset 0x448df3c may be wrong.");
+            SporkLog(@"lua_newthread returned NULL.");
         }
         in_hook_exec = 0;
-        SporkLog(@"Attempt 1 did not crash — offsets are valid but call returned an error. Not retrying.");
         return;
     }
 
@@ -112,7 +137,7 @@ void ExecuteLuauBytecode(const char* source, size_t size) {
     in_hook_exec = 0;
     SporkLog(@"Attempt 1 CRASHED (signal %d) — trying direct-load fallback", sig);
 
-    // ===== Attempt 2: luau_load directly on g_live_L → pcall =====
+    // ===== Attempt 2: luau_load directly on g_live_L -> pcall =====
     SporkLog(@"--- Attempt 2: direct luau_load on L + pcall ---");
     in_hook_exec = 1;
     sig = sigsetjmp(hook_jump_buffer, 1);
@@ -134,11 +159,9 @@ void ExecuteLuauBytecode(const char* source, size_t size) {
 
     // Attempt 2 crashed
     in_hook_exec = 0;
-    SporkLog(@"Attempt 2 CRASHED (signal %d) — giving up. Clearing g_live_L.", sig);
+    SporkLog(@"Attempt 2 CRASHED (signal %d) — giving up. Clearing L.", sig);
     g_live_L = NULL;
 }
-
-// --- Everything below this line is UNCHANGED from your original Tweak.xm ---
 
 @interface PassThroughWindow : UIWindow
 @property (nonatomic, weak) UIView *interactableView1;
