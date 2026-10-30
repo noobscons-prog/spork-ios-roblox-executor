@@ -22,13 +22,13 @@ void SporkLog(NSString *format, ...) {
     va_start(args, format);
     NSString *msg = [[NSString alloc] initWithFormat:format arguments:args];
     va_end(args);
-    
+
     NSLog(@"[Spork] %@", msg);
-    
+
     NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
     [formatter setDateFormat:@"HH:mm:ss"];
     NSString *logLine = [NSString stringWithFormat:@"[%@] %@\n", [formatter stringFromDate:[NSDate date]], msg];
-    
+
     NSString *path = getLogPath();
     NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:path];
     if (fileHandle) {
@@ -38,7 +38,7 @@ void SporkLog(NSString *format, ...) {
     } else {
         [logLine writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
     }
-    
+
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!g_logs) g_logs = [NSMutableArray array];
         [g_logs addObject:[logLine stringByTrimmingCharactersInSet:[NSCharacterSet newlineCharacterSet]]];
@@ -46,8 +46,8 @@ void SporkLog(NSString *format, ...) {
     });
 }
 
-typedef int (*lua_pcall_t)(void* L, int nargs, int nresults, int errfunc);
-typedef int (*luau_load_t)(void* L, const char* chunkname, const char* data, size_t size, int env);
+typedef int  (*lua_pcall_t)(void* L, int nargs, int nresults, int errfunc);
+typedef int  (*luau_load_t)(void* L, const char* chunkname, const char* data, size_t size, int env);
 typedef void* (*lua_newthread_t)(void* L);
 typedef void (*luaL_sandboxthread_t)(void* L);
 
@@ -56,28 +56,40 @@ void ExecuteLuauBytecode(const char* source, size_t size) {
         SporkLog(@"L is NULL. Wait for game.");
         return;
     }
-    
+
     uintptr_t base = get_robloxlib_base();
-    luau_load_t luau_load = (luau_load_t)(base + 0x44bc110);
-    lua_pcall_t lua_pcall = (lua_pcall_t)(base + 0x4490fec);
-    lua_newthread_t lua_newthread = (lua_newthread_t)(base + 0x448df3c);
+    luau_load_t        luau_load        = (luau_load_t)(base + 0x44bc110);
+    lua_pcall_t        lua_pcall        = (lua_pcall_t)(base + 0x4490fec);
+    lua_newthread_t    lua_newthread    = (lua_newthread_t)(base + 0x448df3c);
     luaL_sandboxthread_t luaL_sandboxthread = (luaL_sandboxthread_t)(base + 0x1a12ad4);
-    
-    SporkLog(@"Executing script on L: %p", g_live_L);
-    
+
+    SporkLog(@"Exec: base=0x%lx L=%p luau_load=0x%lx pcall=0x%lx newthread=0x%lx sandbox=0x%lx",
+             (unsigned long)base, g_live_L,
+             (unsigned long)(base + 0x44bc110),
+             (unsigned long)(base + 0x4490fec),
+             (unsigned long)(base + 0x448df3c),
+             (unsigned long)(base + 0x1a12ad4));
+    SporkLog(@"Executing script on L: %p (size=%zu)", g_live_L, size);
+
     in_hook_exec = 1;
     int sig = sigsetjmp(hook_jump_buffer, 1);
     if (sig == 0) {
         void* new_L = lua_newthread(g_live_L);
+        SporkLog(@"newthread -> %p", new_L);
         if (new_L) {
             luaL_sandboxthread(new_L);
             int status = luau_load(new_L, "SporkScript", source, size, 0);
+            SporkLog(@"luau_load status=%d", status);
             if (status == 0) {
-                lua_pcall(new_L, 0, 0, 0);
-                SporkLog(@"Executed successfully!");
+                int ret = lua_pcall(new_L, 0, 0, 0);
+                SporkLog(@"pcall returned %d", ret);
+                if (ret == 0) SporkLog(@"Executed successfully!");
+                else          SporkLog(@"pcall error (ret=%d)", ret);
             } else {
                 SporkLog(@"luau_load failed. Status: %d", status);
             }
+        } else {
+            SporkLog(@"lua_newthread returned NULL — OFFSET_LUA_NEWTHREAD (0x448df3c) may be stale.");
         }
         in_hook_exec = 0;
     } else {
@@ -102,7 +114,7 @@ void ExecuteLuauBytecode(const char* source, size_t size) {
         CGPoint point2 = [self.interactableView2 convertPoint:point fromView:self];
         if ([self.interactableView2 pointInside:point2 withEvent:event]) return hitView;
     }
-    return nil; 
+    return nil;
 }
 @end
 
@@ -111,10 +123,9 @@ static PassThroughWindow *overlayWindow = nil;
 __attribute__((constructor))
 static void init() {
     SporkLog(@"Spork injected. Starting UI...");
-    
-    // DELAY INCREASED TO 6 SECONDS
+
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (overlayWindow) return; 
+        if (overlayWindow) return;
 
         UIWindowScene *activeScene = nil;
         for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
@@ -133,17 +144,17 @@ static void init() {
         overlayWindow.frame = [UIScreen mainScreen].bounds;
         overlayWindow.windowLevel = UIWindowLevelAlert + 1000;
         overlayWindow.backgroundColor = [UIColor clearColor];
-        
+
         SporkViewController *vc = [[SporkViewController alloc] init];
         overlayWindow.rootViewController = vc;
         overlayWindow.hidden = NO;
         [overlayWindow makeKeyAndVisible];
-        
+
         overlayWindow.interactableView1 = vc.mainContainer;
         overlayWindow.interactableView2 = vc.floatingButton;
-        
+
         SporkLog(@"UI loaded. Waiting 2 seconds before hooking...");
-        
+
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             SporkLog(@"Starting SetupHooks...");
             SetupHooks();
