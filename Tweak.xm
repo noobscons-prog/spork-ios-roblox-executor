@@ -13,7 +13,8 @@ int g_execution_method = 1;
 NSMutableArray<NSString *> *g_logs = nil;
 
 // The GUI payload we will inject into Roblox
-static const char* g_gui_script = 
+// REMOVED 'static' so hooks.mm can link to it
+const char* g_gui_script = 
     "local ScreenGui = Instance.new('ScreenGui') "
     "local Main = Instance.new('Frame') "
     "local TextBox = Instance.new('TextBox') "
