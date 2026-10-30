@@ -44,7 +44,6 @@ int my_luau_load_hook(void* L, const char* chunkname, const char* data, size_t s
 
 void install_hook(uintptr_t target_addr, void* hook_func) {
     kern_return_t kr;
-    // Ensure the target address doesn't have PAC signature in it
     uintptr_t target = target_addr & 0x0000FFFFFFFFFFFF;
     uintptr_t page = target & ~0x3FFF;
     
@@ -79,15 +78,13 @@ void install_hook(uintptr_t target_addr, void* hook_func) {
     for (int i = 0; i < 16; i++) tramp[24 + i] = jump_back[i];
     *(uintptr_t*)(tramp + 24 + 8) = target + 24;
 
-    // 3. Prepare patch
+    // 3. Prepare patch (Exactly 24 bytes)
     uint8_t patch[24] = {
-        0x3F, 0x43, 0xC1, 0xDA, // xpaci x16 (strip PAC)
-        0x50, 0x00, 0x00, 0x58, // ldr x16, #8 (load target address)
+        0x3F, 0x43, 0xC1, 0xDA, // xpaci x16
+        0x50, 0x00, 0x00, 0x58, // ldr x16, #8
         0x00, 0x02, 0x1F, 0xD6, // br x16
-        0, 0, 0, 0,             // placeholder for 8-byte pointer
-        0, 0, 0, 0,
-        0, 0, 0, 0,
-        0, 0, 0, 0
+        0, 0, 0, 0, 0, 0, 0, 0, // 8-byte target address placeholder
+        0x1F, 0x20, 0x03, 0xD5  // nop (Padding to 24 bytes)
     };
     // Write our C function pointer into the payload
     *(uintptr_t*)(patch + 12) = (uintptr_t)hook_func;
