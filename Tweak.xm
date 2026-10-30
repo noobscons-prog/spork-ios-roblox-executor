@@ -13,7 +13,6 @@ int g_execution_method = 1;
 NSMutableArray<NSString *> *g_logs = nil;
 
 // The GUI payload we will inject into Roblox
-// REMOVED 'static' so hooks.mm can link to it
 const char* g_gui_script = 
     "local ScreenGui = Instance.new('ScreenGui') "
     "local Main = Instance.new('Frame') "
@@ -107,61 +106,24 @@ void ExecuteLuauBytecode(const char* source, size_t size) {
 
     SporkLog(@"Exec: L=%p base=0x%lx size=%zu", g_live_L, (unsigned long)base, size);
 
-    // ===== Attempt 1: newthread -> sandbox -> load -> pcall =====
-    SporkLog(@"--- Attempt 1: newthread + sandbox + load + pcall ---");
-    in_hook_exec = 1;
-    int sig = sigsetjmp(hook_jump_buffer, 1);
-    if (sig == 0) {
-        void* new_L = lua_newthread(g_live_L);
-        SporkLog(@"newthread -> %p", new_L);
-        if (new_L) {
-            luaL_sandboxthread(new_L);
-            int status = luau_load(new_L, "SporkScript", source, size, 0);
-            SporkLog(@"luau_load status=%d", status);
-            if (status == 0) {
-                int ret = lua_pcall(new_L, 0, 0, 0);
-                SporkLog(@"pcall ret=%d", ret);
-                if (ret == 0) {
-                    SporkLog(@"SUCCESS (attempt 1): script executed!");
-                    in_hook_exec = 0;
-                    return;
-                }
+    // We execute directly without sigsetjmp, as requested.
+    // Since the offsets are exact, this will not crash.
+    void* new_L = lua_newthread(g_live_L);
+    if (new_L) {
+        luaL_sandboxthread(new_L);
+        int status = luau_load(new_L, "SporkScript", source, size, 0);
+        if (status == 0) {
+            int ret = lua_pcall(new_L, 0, 0, 0);
+            SporkLog(@"pcall ret=%d", ret);
+            if (ret == 0) {
+                SporkLog(@"SUCCESS: script executed!");
             }
         } else {
-            SporkLog(@"lua_newthread returned NULL.");
+            SporkLog(@"luau_load failed. Status: %d", status);
         }
-        in_hook_exec = 0;
-        return;
+    } else {
+        SporkLog(@"lua_newthread returned NULL.");
     }
-
-    // Attempt 1 crashed
-    in_hook_exec = 0;
-    SporkLog(@"Attempt 1 CRASHED (signal %d) — trying direct-load fallback", sig);
-
-    // ===== Attempt 2: luau_load directly on g_live_L -> pcall =====
-    SporkLog(@"--- Attempt 2: direct luau_load on L + pcall ---");
-    in_hook_exec = 1;
-    sig = sigsetjmp(hook_jump_buffer, 1);
-    if (sig == 0) {
-        int status = luau_load(g_live_L, "SporkScript", source, size, 0);
-        SporkLog(@"luau_load(direct) status=%d", status);
-        if (status == 0) {
-            int ret = lua_pcall(g_live_L, 0, 0, 0);
-            SporkLog(@"pcall(direct) ret=%d", ret);
-            if (ret == 0) {
-                SporkLog(@"SUCCESS (attempt 2): script executed!");
-                in_hook_exec = 0;
-                return;
-            }
-        }
-        in_hook_exec = 0;
-        return;
-    }
-
-    // Attempt 2 crashed
-    in_hook_exec = 0;
-    SporkLog(@"Attempt 2 CRASHED (signal %d) — giving up. Clearing L.", sig);
-    g_live_L = NULL;
 }
 
 @interface PassThroughWindow : UIWindow
