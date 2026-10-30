@@ -42,95 +42,85 @@ bool safe_read(void* address, void* buffer, size_t size) {
     return (kr == KERN_SUCCESS && out_size == size);
 }
 
-static void log_bytes(uintptr_t addr, const char* name) {
-    uint8_t buf[16] = {0};
-    if (!safe_read((void*)addr, buf, 16)) {
-        SporkLog(@"%s @ 0x%lx: <read failed>", name, (unsigned long)addr);
-        return;
-    }
-    SporkLog(@"%s @ 0x%lx: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
-             name, (unsigned long)addr,
-             buf[0],buf[1],buf[2],buf[3], buf[4],buf[5],buf[6],buf[7],
-             buf[8],buf[9],buf[10],buf[11], buf[12],buf[13],buf[14],buf[15]);
+// ---- Canonical-only lua_State check -------------------------------------
+
+static bool is_canonical_L(uintptr_t cand) {
+    uintptr_t gs = 0;
+    if (!safe_read((void*)(cand + 0x78), &gs, 8)) return false;
+    gs = spork_strip_pac(gs);
+    if (!spork_is_valid_ptr(gs)) return false;
+    uintptr_t mt = 0;
+    if (!safe_read((void*)(gs + 0x1a0), &mt, 8)) return false;
+    return spork_strip_pac(mt) == cand;
 }
 
-static void dump_L_fields(void *L) {
-    SporkLog(@"L=%p field dump (valid pointers only):", L);
-    int count = 0;
-    for (int off = 0; off < 0x200; off += 8) {
-        uintptr_t v = 0;
-        if (!safe_read((void*)((uintptr_t)L + off), &v, 8)) continue;
-        uintptr_t sv = spork_strip_pac(v);
-        if (spork_is_valid_ptr(sv)) {
-            SporkLog(@"  L+0x%03x = %p", off, (void*)sv);
-            if (++count >= 24) { SporkLog(@"  ... (truncated)"); break; }
-        }
-    }
-}
-
-static bool try_find_ls_gs(uintptr_t p, int *out_ls, int *out_gs) {
-    static const int kLs[] = { 0x78, 0x70, 0x80, 0x68, 0x88, 0x60, 0x90, 0x58, 0x98, 0x50 };
-    static const int kGs[] = { 0x1a0, 0x1b8, 0x1c0, 0x1a8, 0x1b0, 0x1d0, 0x198,
-                               0x190, 0x1e0, 0x1e8, 0x1f0, 0x188, 0x180 };
-    for (size_t i = 0; i < sizeof(kLs)/sizeof(kLs[0]); i++) {
-        uintptr_t gs = 0;
-        if (!safe_read((void *)(p + kLs[i]), &gs, 8)) continue;
-        gs = spork_strip_pac(gs);
-        if (!spork_is_valid_ptr(gs)) continue;
-        for (size_t j = 0; j < sizeof(kGs)/sizeof(kGs[0]); j++) {
-            uintptr_t mt = 0;
-            if (!safe_read((void *)(gs + kGs[j]), &mt, 8)) continue;
-            mt = spork_strip_pac(mt);
-            if (mt != p) continue;
-            *out_ls = kLs[i];
-            *out_gs = kGs[j];
-            return true;
-        }
-    }
-    return false;
-}
-
-// Prefer strict canonical (0x78/0x1a0); remember loose candidate as fallback.
-static void *scan_sc_for_lua_state(uintptr_t sc, int sc_off, bool *is_canonical) {
-    void *first_loose = NULL;
-    int loose_ls = 0, loose_gs = 0;
-
-    for (int i = 0; i < 0x8000; i += 8) {
+static void *scan_region_for_canonical_L(uintptr_t region, size_t range,
+                                         const char *label) {
+    for (size_t i = 0; i < range; i += 8) {
         uintptr_t cand = 0;
-        if (!safe_read((char *)sc + i, &cand, 8)) continue;
+        if (!safe_read((char*)region + i, &cand, 8)) continue;
         cand = spork_strip_pac(cand);
         if (!spork_is_valid_ptr(cand)) continue;
-
-        // Canonical check first — takes priority
-        uintptr_t gs = 0;
-        if (safe_read((void*)(cand + 0x78), &gs, 8)) {
-            gs = spork_strip_pac(gs);
-            if (spork_is_valid_ptr(gs)) {
-                uintptr_t mt = 0;
-                if (safe_read((void*)(gs + 0x1a0), &mt, 8) && spork_strip_pac(mt) == cand) {
-                    SporkLog(@"CANONICAL L at SC+0x%x: L=%p (ls=0x78 gs=0x1a0)", i, (void*)cand);
-                    *is_canonical = true;
-                    return (void *)cand;
-                }
-            }
-        }
-
-        if (!first_loose) {
-            int ls_off = 0, gs_off = 0;
-            if (try_find_ls_gs(cand, &ls_off, &gs_off)) {
-                first_loose = (void *)cand;
-                loose_ls = ls_off;
-                loose_gs = gs_off;
-            }
+        if (is_canonical_L(cand)) {
+            SporkLog(@"CANONICAL L: %s+0x%zx -> L=%p", label, i, (void*)cand);
+            return (void*)cand;
         }
     }
-    *is_canonical = false;
-    if (first_loose) {
-        SporkLog(@"LOOSE (non-canonical) L at sc+0x%x: L=%p (ls=0x%x gs=0x%x)",
-                 sc_off, first_loose, loose_ls, loose_gs);
-    }
-    return first_loose;
+    return NULL;
 }
+
+static void dump_object_fields(uintptr_t addr, size_t range, const char *label) {
+    SporkLog(@"%s @ 0x%lx dump:", label, (unsigned long)addr);
+    int shown = 0;
+    for (size_t off = 0; off < range; off += 8) {
+        uintptr_t v = 0;
+        if (!safe_read((void*)(addr + off), &v, 8)) continue;
+        uintptr_t sv = spork_strip_pac(v);
+        if (spork_is_valid_ptr(sv)) {
+            const char *tag = "";
+            if (sv == addr) tag = " [SELF]";
+            else if (sv > 0x10d000000 && sv < 0x120000000) tag = " [code]";
+            SporkLog(@"  +0x%03zx = %p%s", off, (void*)sv, tag);
+            if (++shown >= 32) { SporkLog(@"  ...truncated"); break; }
+        }
+    }
+}
+
+// ---- Deep search from one job ------------------------------------------
+
+static void *find_L_from_job(uintptr_t job) {
+    // A) Is L directly reachable in the job struct?
+    SporkLog(@"-- Checking job region directly --");
+    void *L = scan_region_for_canonical_L(job, 0x400, "job");
+    if (L) return L;
+
+    // B) Try each plausible SC pointer at job+0x100..0x400
+    SporkLog(@"-- Scanning job+0x100..0x400 for SC candidates --");
+    for (int off = 0x100; off < 0x400; off += 8) {
+        uintptr_t sc = 0;
+        if (!safe_read((char*)job + off, &sc, 8)) continue;
+        sc = spork_strip_pac(sc);
+        if (!spork_is_valid_ptr(sc)) continue;
+
+        // Sanity: SC should have a vtable-like first word
+        uintptr_t vt = 0;
+        if (!safe_read((void*)sc, &vt, 8)) continue;
+        vt = spork_strip_pac(vt);
+        if (!spork_is_valid_ptr(vt)) continue;
+
+        // Scan this candidate SC for canonical L
+        char label[32];
+        snprintf(label, sizeof(label), "job+0x%x", off);
+        L = scan_region_for_canonical_L(sc, 0x10000, label);
+        if (L) {
+            SporkLog(@"FOUND SC at job+0x%x, real L=%p", off, L);
+            return L;
+        }
+    }
+    return NULL;
+}
+
+// ---- Vtable hook --------------------------------------------------------
 
 typedef void (*job_step_t)(void* job);
 static job_step_t orig_job_step = NULL;
@@ -141,45 +131,28 @@ void my_job_step(void *job) {
     if (job && !g_live_L && !g_did_initial_scan && !g_given_up) {
         g_did_initial_scan = true;
 
-        static const int kSc[] = { 0x1b0, 0x1a8, 0x1b8, 0x1c0, 0x1a0, 0x1d0,
-                                   0x1e0, 0x198, 0x190, 0x1e8, 0x1f0, 0x188,
-                                   0x1d8, 0x1f8, 0x208, 0x178, 0x170, 0x168 };
-        for (size_t k = 0; k < sizeof(kSc)/sizeof(kSc[0]); k++) {
-            uintptr_t sc = 0;
-            if (!safe_read((char *)job + kSc[k], &sc, 8)) continue;
-            sc = spork_strip_pac(sc);
-            if (!spork_is_valid_ptr(sc)) continue;
+        SporkLog(@"my_job_step fired. Probing job @ %p", job);
+        dump_object_fields((uintptr_t)job, 0x200, "job");
 
-            SporkLog(@"Trying SC candidate at job+0x%x -> %p", kSc[k], (void *)sc);
-            bool is_canonical = false;
-            void *L = scan_sc_for_lua_state(sc, kSc[k], &is_canonical);
-            if (L) {
-                g_live_L = L;
-                SporkLog(@"Set g_live_L = %p (%s match at SC+0x%x)",
-                         L, is_canonical ? "CANONICAL" : "LOOSE", kSc[k]);
-                dump_L_fields(L);
-
-                if (is_canonical) {
-                    SporkLog(@"Auto-testing execution on canonical L...");
-                    ExecuteLuauBytecode("print(\"testing from Spork\")", 27);
-                    if (!g_live_L) {
-                        SporkLog(@"Canonical L failed all attempts — not retrying. Check function offsets.");
-                        g_given_up = true;
-                    }
-                } else {
-                    SporkLog(@"Loose match — skipping auto-exec. Click Execute to try.");
-                }
-                return;
+        void *L = find_L_from_job((uintptr_t)job);
+        if (L) {
+            g_live_L = L;
+            SporkLog(@"Set g_live_L = %p (verified canonical)", L);
+            SporkLog(@"Auto-testing execution...");
+            ExecuteLuauBytecode("print(\"testing from Spork\")", 27);
+            if (!g_live_L) {
+                SporkLog(@"L cleared after failure. Giving up auto-scan.");
+                g_given_up = true;
             }
+            return;
         }
-        if (!g_live_L) {
-            SporkLog(@"No L in any SC candidate — will retry next tick.");
-            g_did_initial_scan = false;
-        }
+        SporkLog(@"No canonical L found in this job. Will retry next tick.");
+        g_did_initial_scan = false;
     }
-
     if (orig_job_step) orig_job_step(job);
 }
+
+// ---- Setup --------------------------------------------------------------
 
 void SetupHooks(void) {
     signal(SIGSEGV, hook_signal_handler);
@@ -188,17 +161,22 @@ void SetupHooks(void) {
     uintptr_t base = get_robloxlib_base();
     if (!base) { SporkLog(@"RobloxLib not found."); return; }
 
-    SporkLog(@"Function offset byte signatures (first 16 bytes):");
-    log_bytes(base + 0x448df3c, "  lua_newthread");
-    log_bytes(base + 0x4490fec, "  lua_pcall");
-    log_bytes(base + 0x44bc110, "  luau_load");
-    log_bytes(base + 0x1a12ad4, "  luaL_sandboxthread");
-
     void *task_scheduler = NULL;
     if (!safe_read((void *)(base + OFFSET_TASKSCHEDULER), &task_scheduler, 8)) {
         SporkLog(@"TaskScheduler read failed."); return;
     }
     task_scheduler = (void *)spork_strip_pac((uintptr_t)task_scheduler);
+    SporkLog(@"TaskScheduler @ %p", task_scheduler);
+
+    // Quick shot: maybe L is directly inside TaskScheduler
+    SporkLog(@"-- Quick scan: TaskScheduler for L --");
+    void *quick_L = scan_region_for_canonical_L((uintptr_t)task_scheduler, 0x400, "ts");
+    if (quick_L) {
+        g_live_L = quick_L;
+        SporkLog(@"Found L inside TaskScheduler! L=%p", quick_L);
+        ExecuteLuauBytecode("print(\"testing from Spork\")", 27);
+        return;
+    }
 
     uintptr_t start = 0, end = 0;
     safe_read((char *)task_scheduler + OFFSET_TS_JOBS_START, &start, 8);
@@ -209,9 +187,8 @@ void SetupHooks(void) {
     SporkLog(@"Scanning Jobs (auto-detecting name offset)...");
 
     static const int kNameOff[] = { 0x18, 0x20, 0x28, 0x10, 0x30, 0x38, 0x40, 0x08, 0x48, 0x50 };
-    uintptr_t detected_job = 0;
-    char detected_name[128] = {0};
-    int detected_name_off = -1;
+    uintptr_t hybrid_jobs[8] = {0};
+    int num_hybrid = 0;
 
     for (uintptr_t ptr = start; ptr + 8 <= end; ptr += 0x10) {
         void *j = NULL;
@@ -220,7 +197,6 @@ void SetupHooks(void) {
         if (!spork_is_valid_ptr(sj)) continue;
 
         const char *name = NULL;
-        int name_off = -1;
         for (size_t k = 0; k < sizeof(kNameOff)/sizeof(kNameOff[0]); k++) {
             uintptr_t raw = 0;
             if (!safe_read((char *)sj + kNameOff[k], &raw, 8)) continue;
@@ -234,43 +210,55 @@ void SetupHooks(void) {
                 if (buf[b] < 0x20 || buf[b] > 0x7e) { ok = false; break; }
                 len++;
             }
-            if (ok && len >= 4) { name = buf; name_off = kNameOff[k]; break; }
+            if (ok && len >= 4) { name = buf; break; }
         }
         if (!name) continue;
 
-        SporkLog(@"Job: '%s' @ %p (name+0x%x)", name, (void *)sj, name_off);
-
         if (strcmp(name, "WaitingHybridScriptsJob") == 0) {
-            strncpy(detected_name, name, sizeof(detected_name) - 1);
-            detected_name_off = name_off;
-            detected_job = sj;
+            if (num_hybrid < 8) {
+                hybrid_jobs[num_hybrid++] = sj;
+                SporkLog(@"WaitingHybridScriptsJob[%d] @ %p", num_hybrid - 1, (void*)sj);
+            }
         }
     }
 
-    if (detected_job == 0) {
-        SporkLog(@"ERROR: WaitingHybridScriptsJob not found.");
+    if (num_hybrid == 0) {
+        SporkLog(@"ERROR: no WaitingHybridScriptsJob instances found.");
         return;
     }
 
-    SporkLog(@"Hooking '%s' @ %p (name+0x%x)",
-             detected_name, (void *)detected_job, detected_name_off);
+    // Try each candidate job synchronously (we're in the game thread)
+    for (int i = 0; i < num_hybrid; i++) {
+        SporkLog(@"=== Trying job[%d] @ %p ===", i, (void*)hybrid_jobs[i]);
+        void *L = find_L_from_job(hybrid_jobs[i]);
+        if (L) {
+            g_live_L = L;
+            SporkLog(@"Set g_live_L = %p (job[%d] canonical)", L, i);
+            ExecuteLuauBytecode("print(\"testing from Spork\")", 27);
+            if (g_live_L) {
+                SporkLog(@"SUCCESS via job[%d]. Hooking vtable anyway for future.", i);
+            }
+            break;
+        }
+    }
 
-    void **original_vtable = *(void ***)detected_job;
+    // Hook vtable of the LAST WaitingHybridScriptsJob (used as backup trigger)
+    uintptr_t hj = hybrid_jobs[num_hybrid - 1];
+    SporkLog(@"Hooking vtable of WaitingHybridScriptsJob @ %p", (void*)hj);
+    void **original_vtable = *(void ***)hj;
     orig_job_step = (job_step_t)original_vtable[0];
-
     void **new_vtable = (void **)malloc(0x1000);
     memcpy(new_vtable, original_vtable, 0x1000);
     new_vtable[0] = (void *)my_job_step;
-
-    uintptr_t job_page = detected_job & ~0x3FFFULL;
+    uintptr_t job_page = hj & ~0x3FFFULL;
     kern_return_t kr = vm_protect(mach_task_self(),
                                   (vm_address_t)job_page, 0x4000,
                                   false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
     if (kr == KERN_SUCCESS) {
-        *(void ***)detected_job = new_vtable;
+        *(void ***)hj = new_vtable;
         vm_protect(mach_task_self(), (vm_address_t)job_page, 0x4000,
                    false, VM_PROT_READ | VM_PROT_EXECUTE);
-        SporkLog(@"VTable hooked on WaitingHybridScriptsJob.");
+        SporkLog(@"VTable hooked on last WaitingHybridScriptsJob.");
     } else {
         SporkLog(@"vm_protect failed: %d", kr);
         free(new_vtable);
