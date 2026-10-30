@@ -42,92 +42,26 @@ bool safe_read(void* address, void* buffer, size_t size) {
     return (kr == KERN_SUCCESS && out_size == size);
 }
 
-// Reject self-loops AND require a plausible global pointer at +0x78.
-// Real lua_State has a heap pointer here. NaN sentinel (0x99999999999a),
-// self-reference, or 0 all fail this test.
-static bool has_real_global_field(uintptr_t cand) {
+// STRICT: Only accepts canonical Roblox lua_State layout.
+// L+0x78 -> global_State
+// global_State+0x1a0 -> back to L
+static bool is_canonical_L(uintptr_t cand) {
     uintptr_t gs = 0;
+    // 1. Read global_State pointer
     if (!safe_read((void*)(cand + 0x78), &gs, 8)) return false;
     gs = spork_strip_pac(gs);
+    
+    // 2. Validate global_State pointer
     if (!spork_is_valid_ptr(gs)) return false;
-    if (gs == cand) return false;
-    // Also reject anything whose top byte is 0x99/0xff tag pattern
-    if ((gs >> 48) == 0x99) return false;
-    return true;
-}
-
-// Canonical: 0x78 -> global_State; global_State+0x1a0 -> back to L.
-static bool is_canonical_L(uintptr_t cand) {
-    if (!has_real_global_field(cand)) return false;
-    uintptr_t gs = 0;
-    safe_read((void*)(cand + 0x78), &gs, 8);
-    gs = spork_strip_pac(gs);
+    if (gs == cand) return false; // Reject self-loops
+    if ((gs >> 48) == 0x99) return false; // Reject NaN sentinels (like 0x99999999999a)
+    
+    // 3. Read mainthread pointer from global_State
     uintptr_t mt = 0;
     if (!safe_read((void*)(gs + 0x1a0), &mt, 8)) return false;
+    
+    // 4. Must point back to original candidate
     return spork_strip_pac(mt) == cand;
-}
-
-// Wide: allow other (ls,gs) offsets but still REQUIRE +0x78 to be a real pointer.
-// That single requirement filters out the NaN/sentinel-stuffed imposters.
-static bool try_find_ls_gs_strict(uintptr_t p, int *out_ls, int *out_gs) {
-    if (!has_real_global_field(p)) return false;   // <<< hard filter
-
-    static const int kLs[] = {
-        0x78, 0x70, 0x80, 0x68, 0x88, 0x60, 0x90, 0x58, 0x98, 0x50,
-        0xa0, 0x48, 0xa8, 0x40, 0xb0, 0x38, 0xb8, 0x30, 0xc0, 0x28,
-    };
-    static const int kGs[] = {
-        0x1a0, 0x1b8, 0x1c0, 0x1a8, 0x1b0, 0x1d0, 0x198, 0x190,
-        0x1e0, 0x1e8, 0x1f0, 0x188, 0x180, 0x1d8, 0x1f8, 0x200,
-        0x208, 0x210, 0x218, 0x220,
-    };
-    for (size_t i = 0; i < sizeof(kLs)/sizeof(kLs[0]); i++) {
-        uintptr_t gs = 0;
-        if (!safe_read((void *)(p + kLs[i]), &gs, 8)) continue;
-        gs = spork_strip_pac(gs);
-        if (!spork_is_valid_ptr(gs)) continue;
-        if (gs == p) continue;
-        if ((gs >> 48) == 0x99) continue;
-        for (size_t j = 0; j < sizeof(kGs)/sizeof(kGs[0]); j++) {
-            uintptr_t mt = 0;
-            if (!safe_read((void *)(gs + kGs[j]), &mt, 8)) continue;
-            mt = spork_strip_pac(mt);
-            if (mt != p) continue;
-            *out_ls = kLs[i];
-            *out_gs = kGs[j];
-            return true;
-        }
-    }
-    return false;
-}
-
-static void dump_L_fields(uintptr_t L) {
-    SporkLog(@"L @ 0x%lx field dump:", (unsigned long)L);
-    int shown = 0;
-    for (int off = 0; off < 0x200; off += 8) {
-        uintptr_t v = 0;
-        if (!safe_read((void*)(L + off), &v, 8)) continue;
-        uintptr_t sv = spork_strip_pac(v);
-        if (!spork_is_valid_ptr(sv)) continue;
-        SporkLog(@"  L+0x%03x = %p", off, (void*)sv);
-        if (++shown >= 24) { SporkLog(@"  ..."); break; }
-    }
-}
-
-static bool check_L(uintptr_t cand, const char *why) {
-    if (is_canonical_L(cand)) {
-        SporkLog(@"FOUND L (CANONICAL): %p [%s]", (void*)cand, why);
-        dump_L_fields(cand);
-        return true;
-    }
-    int ls_off = 0, gs_off = 0;
-    if (try_find_ls_gs_strict(cand, &ls_off, &gs_off)) {
-        SporkLog(@"FOUND L (wide, +0x78 valid): %p (ls=0x%x gs=0x%x) [%s]",
-                 (void*)cand, ls_off, gs_off, why);
-        dump_L_fields(cand);
-        return true;
-    }
-    return false;
 }
 
 static uintptr_t scan_region_for_L(uintptr_t base, size_t range, const char *label) {
@@ -136,7 +70,11 @@ static uintptr_t scan_region_for_L(uintptr_t base, size_t range, const char *lab
         if (!safe_read((char*)base + i, &cand, 8)) continue;
         cand = spork_strip_pac(cand);
         if (!spork_is_valid_ptr(cand)) continue;
-        if (check_L(cand, label)) return cand;
+        
+        if (is_canonical_L(cand)) {
+            SporkLog(@"FOUND L: %p [%s+0x%zx]", (void*)cand, label, i);
+            return cand;
+        }
     }
     return 0;
 }
@@ -151,54 +89,57 @@ static bool g_given_up = false;
 void my_job_step(void *job) {
     g_tick_count++;
 
+    // Rate limit to once per ~5 seconds (300 ticks) to avoid lag
     if (job && !g_live_L && !g_given_up && (g_tick_count - g_last_scan_tick > 300)) {
         g_last_scan_tick = g_tick_count;
         g_scan_attempt++;
-        SporkLog(@"=== Scan attempt %d (tick %d) job=%p ===", g_scan_attempt, g_tick_count, job);
+        SporkLog(@"=== Scan attempt %d (tick %d) ===", g_scan_attempt, g_tick_count);
 
-        // 1) Direct: job+0x1b0 is ScriptContext on this build. Scan it FIRST.
         uintptr_t found = 0;
+
+        // 1. Scan job+0x1b0 (ScriptContext)
         uintptr_t sc = 0;
         if (safe_read((char*)job + 0x1b0, &sc, 8)) {
             sc = spork_strip_pac(sc);
             if (spork_is_valid_ptr(sc)) {
-                SporkLog(@"job+0x1b0 -> 0x%lx (ScriptContext candidate)", (unsigned long)sc);
-                found = scan_region_for_L(sc, 0x8000, "SC(job+0x1b0)");
+                SporkLog(@"Scanning SC at job+0x1b0 -> 0x%lx", (unsigned long)sc);
+                found = scan_region_for_L(sc, 0x8000, "SC(0x1b0)");
             }
         }
 
-        // 2) Also try job+0x188, another known SC-ish pointer field
+        // 2. Scan job+0x188 (DataModel / alternate SC)
         if (!found) {
             uintptr_t sc2 = 0;
             if (safe_read((char*)job + 0x188, &sc2, 8)) {
                 sc2 = spork_strip_pac(sc2);
                 if (spork_is_valid_ptr(sc2) && sc2 != sc) {
-                    SporkLog(@"job+0x188 -> 0x%lx (SC candidate #2)", (unsigned long)sc2);
-                    found = scan_region_for_L(sc2, 0x8000, "SC(job+0x188)");
+                    SporkLog(@"Scanning SC at job+0x188 -> 0x%lx", (unsigned long)sc2);
+                    found = scan_region_for_L(sc2, 0x8000, "SC(0x188)");
                 }
             }
         }
 
-        // 3) Fallback: scan the job's own pointer fields for an L directly
+        // 3. Fallback: Check job's own pointer fields (excluding SELF at 0x08/0x10)
         if (!found) {
-            for (int off = 0x08; off < 0x400 && !found; off += 8) {
-                if (off == 0x08) continue;   // skip SELF — caused the fake hit last time
-                if (off == 0x10) continue;   // skip SELF-adjacent
-                if (off == 0x1b0) continue;  // already tried above
-                if (off == 0x188) continue;  // already tried above
+            for (int off = 0x18; off < 0x400 && !found; off += 8) {
+                if (off == 0x1b0 || off == 0x188) continue; // Already checked
                 uintptr_t p = 0;
                 if (!safe_read((char*)job + off, &p, 8)) continue;
                 p = spork_strip_pac(p);
                 if (!spork_is_valid_ptr(p)) continue;
-                char why[64]; snprintf(why, sizeof(why), "job+0x%x", off);
-                if (check_L(p, why)) { found = p; break; }
+                if (is_canonical_L(p)) {
+                    SporkLog(@"FOUND L: %p [job+0x%x direct]", (void*)p, off);
+                    found = p;
+                }
             }
         }
 
         if (found) {
             g_live_L = (void*)found;
             SporkLog(@"Set g_live_L = %p", g_live_L);
+            // Tweak.xm handles the execution and crash catching
             ExecuteLuauBytecode("print(\"testing from Spork\")", 27);
+            
             if (!g_live_L) {
                 SporkLog(@"Execution failed. Giving up.");
                 g_given_up = true;
