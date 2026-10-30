@@ -65,6 +65,7 @@ bool FindLuaState(void) {
                         sc = (void*)STRIP_PAC_SCAN(sc);
                         if ((uintptr_t)sc > 0x100000000 && (uintptr_t)sc < 0x7FFFFFFFFFFF) {
                             g_script_context = sc;
+                            SporkLog(@"[FIND] Found global ScriptContext: %p", g_script_context);
                             break;
                         }
                     }
@@ -75,7 +76,8 @@ bool FindLuaState(void) {
 
     if (!g_script_context) return false;
 
-    for (int i = 0; i < 0x8000; i += 8) {
+    // Increased scan size to 0x30000 (196KB) to find deeply nested states
+    for (int i = 0; i < 0x30000; i += 8) {
         uintptr_t ptr = 0;
         if (safe_read((char*)g_script_context + i, &ptr, 8)) {
             uintptr_t stripped_ptr = STRIP_PAC_SCAN(ptr);
@@ -90,17 +92,18 @@ bool FindLuaState(void) {
                         global_state = STRIP_PAC_SCAN(global_state);
                         
                         if (global_state > 0x100000000 && global_state < 0x7FFFFFFFFFFF) {
-                            // Read stringtable in global_State to verify it's valid
                             uint32_t size = 0;
                             uint32_t nuse = 0;
                             if (safe_read((void*)(global_state + 0xc), &size, 4) &&
                                 safe_read((void*)(global_state + 0x8), &nuse, 4)) {
                                 
-                                // Size must be a power of 2, and nuse <= size
+                                // Verify stringtable size is a power of 2
                                 if (size > 0 && (size & (size - 1)) == 0 && nuse <= size) {
-                                    SporkLog(@"[FIND] Valid L found at 0x%X: %p", i, (void*)stripped_ptr);
+                                    SporkLog(@"[FIND] Valid LuaState at offset 0x%X: %p", i, (void*)stripped_ptr);
                                     g_live_L = (void*)stripped_ptr;
                                     return true;
+                                } else {
+                                    SporkLog(@"[FAIL] Rejected tt=9 at 0x%X: size=%u nuse=%u", i, size, nuse);
                                 }
                             }
                         }
