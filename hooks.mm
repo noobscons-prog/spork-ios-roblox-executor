@@ -42,26 +42,40 @@ bool safe_read(void* address, void* buffer, size_t size) {
     return (kr == KERN_SUCCESS && out_size == size);
 }
 
-// STRICT: Only accepts canonical Roblox lua_State layout.
-// L+0x78 -> global_State
-// global_State+0x1a0 -> back to L
-static bool is_canonical_L(uintptr_t cand) {
-    uintptr_t gs = 0;
-    // 1. Read global_State pointer
-    if (!safe_read((void*)(cand + 0x78), &gs, 8)) return false;
-    gs = spork_strip_pac(gs);
+// Fast, strict check covering multiple iOS Luau struct layouts
+static bool find_L_offsets(uintptr_t cand, int *out_ls, int *out_gs) {
+    // Known (lua_State::global, global_State::mainthread) pairs for various builds
+    static const struct { int ls; int gs; } pairs[] = {
+        {0x78, 0x1a0}, // Standard PC
+        {0x70, 0x1b8}, // iOS ABI variation 1
+        {0x68, 0x1c0}, // iOS ABI variation 2
+        {0x60, 0x1b0}, // Seen in previous dump
+        {0x80, 0x198}, // iOS ABI variation 3
+        {0x78, 0x1b0},
+        {0x70, 0x1a8},
+        {0x60, 0x1a0},
+        {0x58, 0x1b8},
+    };
     
-    // 2. Validate global_State pointer
-    if (!spork_is_valid_ptr(gs)) return false;
-    if (gs == cand) return false; // Reject self-loops
-    if ((gs >> 48) == 0x99) return false; // Reject NaN sentinels (like 0x99999999999a)
-    
-    // 3. Read mainthread pointer from global_State
-    uintptr_t mt = 0;
-    if (!safe_read((void*)(gs + 0x1a0), &mt, 8)) return false;
-    
-    // 4. Must point back to original candidate
-    return spork_strip_pac(mt) == cand;
+    for (int i = 0; i < sizeof(pairs)/sizeof(pairs[0]); i++) {
+        uintptr_t gs = 0;
+        if (!safe_read((void*)(cand + pairs[i].ls), &gs, 8)) continue;
+        gs = spork_strip_pac(gs);
+        
+        // Validate global_State pointer (no self-loops, no NaN sentinels)
+        if (!spork_is_valid_ptr(gs) || gs == cand || (gs >> 48) == 0x99) continue;
+        
+        uintptr_t mt = 0;
+        if (!safe_read((void*)(gs + pairs[i].gs), &mt, 8)) continue;
+        
+        // Round-trip check: global_State->mainthread == lua_State
+        if (spork_strip_pac(mt) == cand) {
+            *out_ls = pairs[i].ls;
+            *out_gs = pairs[i].gs;
+            return true;
+        }
+    }
+    return false;
 }
 
 static uintptr_t scan_region_for_L(uintptr_t base, size_t range, const char *label) {
@@ -71,8 +85,10 @@ static uintptr_t scan_region_for_L(uintptr_t base, size_t range, const char *lab
         cand = spork_strip_pac(cand);
         if (!spork_is_valid_ptr(cand)) continue;
         
-        if (is_canonical_L(cand)) {
-            SporkLog(@"FOUND L: %p [%s+0x%zx]", (void*)cand, label, i);
+        int ls = 0, gs = 0;
+        if (find_L_offsets(cand, &ls, &gs)) {
+            SporkLog(@"FOUND L: %p (ls=0x%x gs=0x%x) [%s+0x%zx]", 
+                     (void*)cand, ls, gs, label, i);
             return cand;
         }
     }
@@ -89,7 +105,7 @@ static bool g_given_up = false;
 void my_job_step(void *job) {
     g_tick_count++;
 
-    // Rate limit to once per ~5 seconds (300 ticks) to avoid lag
+    // Rate limit to once per ~5 seconds (300 ticks)
     if (job && !g_live_L && !g_given_up && (g_tick_count - g_last_scan_tick > 300)) {
         g_last_scan_tick = g_tick_count;
         g_scan_attempt++;
@@ -97,39 +113,23 @@ void my_job_step(void *job) {
 
         uintptr_t found = 0;
 
-        // 1. Scan job+0x1b0 (ScriptContext)
+        // 1. Check job+0x1b0 (ScriptContext)
         uintptr_t sc = 0;
         if (safe_read((char*)job + 0x1b0, &sc, 8)) {
             sc = spork_strip_pac(sc);
             if (spork_is_valid_ptr(sc)) {
-                SporkLog(@"Scanning SC at job+0x1b0 -> 0x%lx", (unsigned long)sc);
-                found = scan_region_for_L(sc, 0x8000, "SC(0x1b0)");
+                // Scan up to 64KB inside ScriptContext
+                found = scan_region_for_L(sc, 0x10000, "SC(0x1b0)");
             }
         }
 
-        // 2. Scan job+0x188 (DataModel / alternate SC)
+        // 2. Check job+0x188 (DataModel / alternate SC)
         if (!found) {
             uintptr_t sc2 = 0;
             if (safe_read((char*)job + 0x188, &sc2, 8)) {
                 sc2 = spork_strip_pac(sc2);
                 if (spork_is_valid_ptr(sc2) && sc2 != sc) {
-                    SporkLog(@"Scanning SC at job+0x188 -> 0x%lx", (unsigned long)sc2);
-                    found = scan_region_for_L(sc2, 0x8000, "SC(0x188)");
-                }
-            }
-        }
-
-        // 3. Fallback: Check job's own pointer fields (excluding SELF at 0x08/0x10)
-        if (!found) {
-            for (int off = 0x18; off < 0x400 && !found; off += 8) {
-                if (off == 0x1b0 || off == 0x188) continue; // Already checked
-                uintptr_t p = 0;
-                if (!safe_read((char*)job + off, &p, 8)) continue;
-                p = spork_strip_pac(p);
-                if (!spork_is_valid_ptr(p)) continue;
-                if (is_canonical_L(p)) {
-                    SporkLog(@"FOUND L: %p [job+0x%x direct]", (void*)p, off);
-                    found = p;
+                    found = scan_region_for_L(sc2, 0x10000, "SC(0x188)");
                 }
             }
         }
@@ -137,13 +137,9 @@ void my_job_step(void *job) {
         if (found) {
             g_live_L = (void*)found;
             SporkLog(@"Set g_live_L = %p", g_live_L);
-            // Tweak.xm handles the execution and crash catching
-            ExecuteLuauBytecode("print(\"testing from Spork\")", 27);
-            
-            if (!g_live_L) {
-                SporkLog(@"Execution failed. Giving up.");
-                g_given_up = true;
-            }
+            SporkLog(@"SUCCESS: L found! Open the UI and click Execute.");
+            // We intentionally do NOT auto-execute here to prevent crashes.
+            // Let the user click Execute manually.
         } else if (g_scan_attempt >= 5) {
             SporkLog(@"Giving up after %d attempts.", g_scan_attempt);
             g_given_up = true;
