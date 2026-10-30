@@ -42,19 +42,27 @@ bool safe_read(void* address, void* buffer, size_t size) {
     return (kr == KERN_SUCCESS && out_size == size);
 }
 
-// Fast, strict check covering multiple iOS Luau struct layouts
+// Blacklist to skip fake Ls that crash during execution
+static uintptr_t g_bad_Ls[16] = {0};
+static int g_num_bad = 0;
+
 static bool find_L_offsets(uintptr_t cand, int *out_ls, int *out_gs) {
-    // Known (lua_State::global, global_State::mainthread) pairs for various builds
+    for (int j = 0; j < g_num_bad; j++) {
+        if (cand == g_bad_Ls[j]) return false; // Skip blacklisted
+    }
+
     static const struct { int ls; int gs; } pairs[] = {
         {0x78, 0x1a0}, // Standard PC
-        {0x70, 0x1b8}, // iOS ABI variation 1
-        {0x68, 0x1c0}, // iOS ABI variation 2
-        {0x60, 0x1b0}, // Seen in previous dump
-        {0x80, 0x198}, // iOS ABI variation 3
-        {0x78, 0x1b0},
-        {0x70, 0x1a8},
-        {0x60, 0x1a0},
-        {0x58, 0x1b8},
+        {0x78, 0x1b0}, 
+        {0x78, 0x1b8}, 
+        {0x70, 0x1a0}, 
+        {0x70, 0x1b0}, 
+        {0x68, 0x1a0}, 
+        {0x68, 0x1b0}, 
+        {0x60, 0x1a0}, 
+        {0x60, 0x1b0}, // Seen in logs (likely fake)
+        {0x58, 0x1a0}, 
+        {0x58, 0x1b0}, 
     };
     
     for (int i = 0; i < sizeof(pairs)/sizeof(pairs[0]); i++) {
@@ -62,13 +70,12 @@ static bool find_L_offsets(uintptr_t cand, int *out_ls, int *out_gs) {
         if (!safe_read((void*)(cand + pairs[i].ls), &gs, 8)) continue;
         gs = spork_strip_pac(gs);
         
-        // Validate global_State pointer (no self-loops, no NaN sentinels)
-        if (!spork_is_valid_ptr(gs) || gs == cand || (gs >> 48) == 0x99) continue;
+        if (!spork_is_valid_ptr(gs) || gs == cand) continue;
+        if ((gs >> 48) == 0x99) continue; // NaN check
         
         uintptr_t mt = 0;
         if (!safe_read((void*)(gs + pairs[i].gs), &mt, 8)) continue;
         
-        // Round-trip check: global_State->mainthread == lua_State
         if (spork_strip_pac(mt) == cand) {
             *out_ls = pairs[i].ls;
             *out_gs = pairs[i].gs;
@@ -105,11 +112,10 @@ static bool g_given_up = false;
 void my_job_step(void *job) {
     g_tick_count++;
 
-    // Rate limit to once per ~5 seconds (300 ticks)
-    if (job && !g_live_L && !g_given_up && (g_tick_count - g_last_scan_tick > 300)) {
+    if (job && !g_given_up && (g_tick_count - g_last_scan_tick > 300)) {
         g_last_scan_tick = g_tick_count;
         g_scan_attempt++;
-        SporkLog(@"=== Scan attempt %d (tick %d) ===", g_scan_attempt, g_tick_count);
+        SporkLog(@"=== Scan attempt %d (tick %d) job=%p ===", g_scan_attempt, g_tick_count, job);
 
         uintptr_t found = 0;
 
@@ -117,9 +123,9 @@ void my_job_step(void *job) {
         uintptr_t sc = 0;
         if (safe_read((char*)job + 0x1b0, &sc, 8)) {
             sc = spork_strip_pac(sc);
+            SporkLog(@"job+0x1b0 -> %p", (void*)sc);
             if (spork_is_valid_ptr(sc)) {
-                // Scan up to 64KB inside ScriptContext
-                found = scan_region_for_L(sc, 0x10000, "SC(0x1b0)");
+                found = scan_region_for_L(sc, 0x8000, "SC(0x1b0)");
             }
         }
 
@@ -128,18 +134,40 @@ void my_job_step(void *job) {
             uintptr_t sc2 = 0;
             if (safe_read((char*)job + 0x188, &sc2, 8)) {
                 sc2 = spork_strip_pac(sc2);
+                SporkLog(@"job+0x188 -> %p", (void*)sc2);
                 if (spork_is_valid_ptr(sc2) && sc2 != sc) {
-                    found = scan_region_for_L(sc2, 0x10000, "SC(0x188)");
+                    found = scan_region_for_L(sc2, 0x8000, "SC(0x188)");
                 }
             }
         }
 
+        // 3. Direct scan of the job memory
+        if (!found) {
+            SporkLog(@"Scanning job memory directly (128KB)...");
+            found = scan_region_for_L((uintptr_t)job, 0x20000, "Job");
+        }
+
         if (found) {
             g_live_L = (void*)found;
-            SporkLog(@"Set g_live_L = %p", g_live_L);
-            SporkLog(@"SUCCESS: L found! Open the UI and click Execute.");
-            // We intentionally do NOT auto-execute here to prevent crashes.
-            // Let the user click Execute manually.
+            SporkLog(@"Set g_live_L = %p. Auto-testing...", g_live_L);
+            
+            // Auto execute to test the pipeline
+            ExecuteLuauBytecode("print(\"testing from Spork\")", 27);
+            
+            if (!g_live_L) {
+                // It failed or crashed (Tweak.xm caught the signal and cleared L)
+                if (g_num_bad < 16) g_bad_Ls[g_num_bad++] = found;
+                SporkLog(@"Execution failed/crashed for %p. Blacklisted. Will try next candidate in 1s.", (void*)found);
+                g_last_scan_tick = g_tick_count - 240; // Retry in 60 ticks (1s)
+                
+                if (g_scan_attempt >= 15) {
+                    SporkLog(@"Giving up after %d attempts.", g_scan_attempt);
+                    g_given_up = true;
+                }
+            } else {
+                SporkLog(@"SUCCESS: Execution pipeline works! You can now execute scripts.");
+                g_given_up = true; // Stop scanning, we are done
+            }
         } else if (g_scan_attempt >= 5) {
             SporkLog(@"Giving up after %d attempts.", g_scan_attempt);
             g_given_up = true;
@@ -210,8 +238,9 @@ void SetupHooks(void) {
         return;
     }
 
+    // Hook the LAST instance (which was ticking and had valid SC in the 08:18 log)
     uintptr_t hj = hybrid_jobs[num_hybrid - 1];
-    SporkLog(@"Hooking vtable of WaitingHybridScriptsJob @ %p", (void*)hj);
+    SporkLog(@"Hooking vtable of WaitingHybridScriptsJob[%d] @ %p", num_hybrid - 1, (void*)hj);
     void **original_vtable = *(void ***)hj;
     orig_job_step = (job_step_t)original_vtable[0];
     void **new_vtable = (void **)malloc(0x1000);
