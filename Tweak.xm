@@ -2,8 +2,6 @@
 #import <signal.h>
 #import <setjmp.h>
 #import <Foundation/Foundation.h>
-#import <stddef.h>
-#import <stdint.h>
 #import "SporkUI.h"
 #import "hooks.hpp"
 
@@ -48,27 +46,24 @@ void SporkLog(NSString *format, ...) {
     });
 }
 
-extern "C" void ExecuteLuauBytecode(const char* source, size_t size) {
+typedef int (*lua_pcall_t)(void* L, int nargs, int nresults, int errfunc);
+typedef int (*luau_load_t)(void* L, const char* chunkname, const char* data, size_t size, int env);
+typedef void* (*lua_newthread_t)(void* L);
+typedef void (*luaL_sandboxthread_t)(void* L);
+
+void ExecuteLuauBytecode(const char* source, size_t size) {
     if (!g_live_L) {
-        SporkLog(@"L is NULL. Trying to find it...");
-        FindLuaState();
-    }
-    
-    if (!g_live_L) {
-        SporkLog(@"Could not find L. Wait for game to load or try again.");
+        SporkLog(@"L is NULL. Wait for game.");
         return;
     }
     
     uintptr_t base = get_robloxlib_base();
-    if (!base) {
-        SporkLog(@"RobloxLib base is NULL.");
-        return;
-    }
+    luau_load_t luau_load = (luau_load_t)(base + 0x44bc110);
+    lua_pcall_t lua_pcall = (lua_pcall_t)(base + 0x4490fec);
+    lua_newthread_t lua_newthread = (lua_newthread_t)(base + 0x448df3c);
+    luaL_sandboxthread_t luaL_sandboxthread = (luaL_sandboxthread_t)(base + 0x1a12ad4);
     
-    luau_load_t luau_load = (luau_load_t)(base + OFFSET_LUAU_LOAD);
-    lua_pcall_t lua_pcall = (lua_pcall_t)(base + OFFSET_LUA_PCALL);
-    lua_newthread_t lua_newthread = (lua_newthread_t)(base + OFFSET_LUA_NEWTHREAD);
-    luaL_sandboxthread_t luaL_sandboxthread = (luaL_sandboxthread_t)(base + OFFSET_LUA_SANDBOXTHREAD);
+    SporkLog(@"Executing script on L: %p", g_live_L);
     
     in_hook_exec = 1;
     int sig = sigsetjmp(hook_jump_buffer, 1);
@@ -76,24 +71,7 @@ extern "C" void ExecuteLuauBytecode(const char* source, size_t size) {
         void* new_L = lua_newthread(g_live_L);
         if (new_L) {
             luaL_sandboxthread(new_L);
-            
-            int status = -1;
-            if (OFFSET_LUAU_COMPILE != 0x0) {
-                luau_compile_t luau_compile = (luau_compile_t)(base + OFFSET_LUAU_COMPILE);
-                size_t bytecode_size = 0;
-                char* bytecode = luau_compile(source, size, NULL, &bytecode_size);
-                if (bytecode && bytecode_size > 0) {
-                    SporkLog(@"Compiled bytecode size: %zu", bytecode_size);
-                    status = luau_load(new_L, "SporkScript", bytecode, bytecode_size, 0);
-                    free(bytecode);
-                } else {
-                    SporkLog(@"luau_compile failed.");
-                }
-            } else {
-                SporkLog(@"Compiler offset not set. Cannot execute custom scripts yet.");
-                status = -1;
-            }
-            
+            int status = luau_load(new_L, "SporkScript", source, size, 0);
             if (status == 0) {
                 lua_pcall(new_L, 0, 0, 0);
                 SporkLog(@"Executed successfully!");
@@ -134,7 +112,8 @@ __attribute__((constructor))
 static void init() {
     SporkLog(@"Spork injected. Starting UI...");
     
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    // DELAY INCREASED TO 6 SECONDS
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (overlayWindow) return; 
 
         UIWindowScene *activeScene = nil;
