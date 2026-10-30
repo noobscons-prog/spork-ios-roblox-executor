@@ -12,7 +12,6 @@ bool g_is_injected = true;
 int g_execution_method = 1;
 NSMutableArray<NSString *> *g_logs = nil;
 
-// The GUI payload we will inject into Roblox
 const char* g_gui_script = 
     "local ScreenGui = Instance.new('ScreenGui') "
     "local Main = Instance.new('Frame') "
@@ -106,8 +105,7 @@ void ExecuteLuauBytecode(const char* source, size_t size) {
 
     SporkLog(@"Exec: L=%p base=0x%lx size=%zu", g_live_L, (unsigned long)base, size);
 
-    // We execute directly without sigsetjmp, as requested.
-    // Since the offsets are exact, this will not crash.
+    // Direct execution, no sigsetjmp
     void* new_L = lua_newthread(g_live_L);
     if (new_L) {
         luaL_sandboxthread(new_L);
